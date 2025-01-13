@@ -3,11 +3,19 @@
 ## Supported Architectures
 
 - 🦙 [Llama](https://huggingface.co/meta-llama)
-    - [CodeLlama](https://huggingface.co/codellama)
+  - [CodeLlama](https://huggingface.co/codellama)
 - 🌬️[Mistral](https://huggingface.co/mistralai)
-    - [Zephyr](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta)
-- 🔮 [Qwen](https://huggingface.co/Qwen)
+  - [Zephyr](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta)
+- 🔄 [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)
+- 💎 [Gemma](https://blog.google/technology/developers/gemma-open-models/)
+  - [Gemma2](https://huggingface.co/collections/google/gemma-2-release-667d6600fd5220e7b967f315)
+- 🏛️ [Phi-3](https://azure.microsoft.com/en-us/blog/introducing-phi-3-redefining-whats-possible-with-slms/) / [Phi-2](https://huggingface.co/microsoft/phi-2)
+- 🔮 [Qwen2 / Qwen](https://huggingface.co/Qwen)
+- 🗣️ [Command-R](https://docs.cohere.com/docs/command-r)
+- 🧱 [DBRX](https://www.databricks.com/blog/introducing-dbrx-new-state-art-open-llm)
 - 🤖 [GPT2](https://huggingface.co/gpt2)
+- 🔆 [Solar](https://huggingface.co/upstage/SOLAR-10.7B-v1.0)
+- 🌸 [Bloom](https://huggingface.co/bigscience/bloom)
 
 Other architectures are supported on a best effort basis, but do not support dynamic adapter loading.
 
@@ -21,43 +29,28 @@ Usage:
 lorax-launcher --model-id mistralai/Mistral-7B-v0.1 ...
 ```
 
+## Private Models
+
+You can access private base models from HuggingFace by setting the `HUGGING_FACE_HUB_TOKEN` environment variable:
+
+```bash
+export HUGGING_FACE_HUB_TOKEN=<YOUR READ TOKEN>
+```
+
+Using Docker:
+
+```bash
+docker run --gpus all \
+  --shm-size 1g \
+  -p 8080:80 \
+  -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
+  ghcr.io/predibase/lorax:main \
+  --model-id $MODEL_ID
+```
+
 ## Quantization
 
-Base models can be loaded in fp16 (default) or with quantization using any of `bitsandbytes`, [GPT-Q](https://arxiv.org/abs/2210.17323), or [AWQ](https://arxiv.org/abs/2306.00978) format. When using quantization, it is not necessary that
-the adapter was fine-tuned using the quantized version of the base model, but be aware that enabling quantization can have an effect on the response.
+LoRAX supports loading the base model with quantization to reduce memory overhead, while loading adapters in
+full (fp32) or half precision (fp16, bf16), similar to the approach described in [QLoRA](https://arxiv.org/abs/2305.14314).
 
-### bitsandbytes
-
-`bitsandbytes` quantization can be applied to any base model saved in fp16 or bf16 format. It performs quantization at runtime in a model and dataset agnostic manner. As such, it is more flexible but potentially less performant (both in terms of quality and latency) than other quantization options.
-
-There are three flavors of `bitsandbytes` quantization:
-
-- `bitsandbytes` (8-bit integer)
-- `bitsandbytes-fp4` (4-bit float)
-- `bitsandbytes-nf4` (4-bit normal float)
-
-Usage:
-
-```shell
-lorax-launcher --model-id mistralai/Mistral-7B-v0.1 --quantize bitsandbytes-nf4 ...
-```
-
-### GPT-Q
-
-[GPT-Q](https://arxiv.org/abs/2210.17323) is a static quantization method, meaning that the quantization needs to be done outside of LoRAX and the weights persisted in order for it to be used with a base model. Thanks to the ExLlama-v2 CUDA kernels, GPT-Q offers very strong inference performance compared with `bitsandbytes`, but may not generalize as well to unseen tasks (as the quantization is done with respect to a particular dataset). 
-
-Usage:
-
-```shell
-lorax-launcher --model-id TheBloke/Mistral-7B-v0.1-GPTQ --quantize gptq ...
-```
-
-### AWQ
-
-[AWQ](https://arxiv.org/abs/2306.00978) is similar to GPT-Q in that the weights are quantized in advance of inference (statically). AWQ is generally faster than GPT-Q for inference, and achieves similarly high levels of quality.
-
-Usage:
-
-```shell
-lorax-launcher --model-id TheBloke/Mistral-7B-v0.1-AWQ --quantize awq ...
-```
+See [Quantization](../guides/quantization.md) for details on the various quantization strategies provided by LoRAX.

@@ -1,25 +1,25 @@
 import re
-import torch
-import torch.distributed
-
 from typing import List, Optional, Type
 
+import torch
+import torch.distributed
 from transformers import (
-    AutoTokenizer,
     AutoConfig,
+    AutoTokenizer,
     PreTrainedTokenizerBase,
 )
-from lorax_server.models import CausalLM
-from lorax_server.models.causal_lm import CausalLMBatch
-from lorax_server.pb import generate_pb2
+
+from lorax_server.models.causal_lm import CausalLM, CausalLMBatch
 from lorax_server.models.custom_modeling.opt_modeling import OPTForCausalLM
+from lorax_server.pb import generate_pb2
 from lorax_server.utils import (
     NextTokenChooser,
     StoppingCriteria,
+    Weights,
     initialize_torch_distributed,
     weight_files,
-    Weights,
 )
+from lorax_server.utils.tokenizer import TokenizerManager
 
 # CREDIT: Papers with code => https://github.com/paperswithcode/galai/blob/main/galai/utils.py
 
@@ -73,6 +73,9 @@ class GalacticaCausalLMBatch(CausalLMBatch):
         cls,
         pb: generate_pb2.Batch,
         tokenizer: PreTrainedTokenizerBase,
+        tokenizers: TokenizerManager,
+        processor,
+        config,
         dtype: torch.dtype,
         device: torch.device,
     ) -> "GalacticaCausalLMBatch":
@@ -90,17 +93,14 @@ class GalacticaCausalLMBatch(CausalLMBatch):
         for i, r in enumerate(pb.requests):
             requests_idx_mapping[r.id] = i
             # Add escape_custom_split_sequence to the CausalLMBatch logic
-            inputs.append(escape_custom_split_sequence(r.inputs))
-            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device))
-            stopping_criteria = StoppingCriteria.from_pb(
-                r.stopping_parameters, tokenizer
-            )
+            req_inputs = tokenizers.get_inputs(r, tokenizer)
+            inputs.append(escape_custom_split_sequence(req_inputs))
+            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device, tokenizer))
+            stopping_criteria = StoppingCriteria.from_pb(r.stopping_parameters, tokenizer)
             stopping_criterias.append(stopping_criteria)
             max_truncation = max(max_truncation, r.truncate)
             max_decode_tokens += stopping_criteria.max_new_tokens
-            padding_right_offset = max(
-                padding_right_offset, stopping_criteria.max_new_tokens
-            )
+            padding_right_offset = max(padding_right_offset, stopping_criteria.max_new_tokens)
 
         tokenized_inputs = tokenizer(
             inputs,
@@ -120,9 +120,7 @@ class GalacticaCausalLMBatch(CausalLMBatch):
 
         input_ids = tokenized_inputs["input_ids"]
         # Allocate maximum attention_mask
-        attention_mask = input_ids.new_zeros(
-            (pb.size, max_input_length + padding_right_offset)
-        )
+        attention_mask = input_ids.new_zeros((pb.size, max_input_length + padding_right_offset))
         # Copy tokenizer attention_mask into fully allocated attention_mask
         attention_mask[:, :max_input_length] = tokenized_inputs["attention_mask"]
 
@@ -158,9 +156,13 @@ class GalacticaSharded(CausalLM):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        compile: bool = False,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
+        if compile:
+            raise ValueError("`--compile` is not supported with GalacticaSharded")
+
         self.process_group, rank, world_size = initialize_torch_distributed()
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
@@ -188,16 +190,14 @@ class GalacticaSharded(CausalLM):
 
         torch.distributed.barrier(group=self.process_group)
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(
-            filenames, device=device, dtype=dtype, process_group=self.process_group
-        )
-        if config.quantize == "gptq":
-            weights._set_gptq_params(model_id)
+        weights = Weights(filenames, device=device, dtype=dtype, process_group=self.process_group)
+        weights._set_config(model_id, config)
 
         model = OPTForCausalLM(config, weights)
 
         torch.distributed.barrier(group=self.process_group)
         super(CausalLM, self).__init__(
+            model_id=model_id,
             model=model,
             tokenizer=tokenizer,
             requires_padding=True,
@@ -205,6 +205,7 @@ class GalacticaSharded(CausalLM):
             device=device,
             rank=rank,
             world_size=world_size,
+            trust_remote_code=trust_remote_code,
         )
 
     @property
@@ -213,13 +214,9 @@ class GalacticaSharded(CausalLM):
 
     def decode(self, generated_ids: List[int]) -> str:
         # Do not skip special tokens as they are used for custom parsing rules of the generated text
-        return self.tokenizer.decode(
-            generated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
-        )
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
-    def forward(
-        self, input_ids, attention_mask, position_ids, past_key_values: Optional = None
-    ):
+    def forward(self, input_ids, attention_mask, position_ids, past_key_values: Optional = None):
         outputs = self.model.forward(
             input_ids=input_ids,
             attention_mask=attention_mask,

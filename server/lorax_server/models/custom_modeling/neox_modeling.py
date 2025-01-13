@@ -12,41 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch GPTNeoX model."""
-
-from typing import Optional, Tuple, Union
+"""PyTorch GPTNeoX model."""
 
 import os
+from typing import Optional, Tuple, Union
+
 import torch
 import torch.distributed
 import torch.utils.checkpoint
+from loguru import logger
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
+from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
-from transformers.file_utils import (
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    replace_return_docstrings,
-)
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers import GPTNeoXConfig
-from loguru import logger
+
 from lorax_server.utils.layers import (
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
-    TensorParallelRowLinear,
     TensorParallelHead,
+    TensorParallelRowLinear,
 )
-
 
 CUSTOM_KERNELS_ENABLED = False
 if not os.environ.get("DISABLE_CUSTOM_KERNELS", "False") == "True":
@@ -75,9 +64,7 @@ def make_causal_mask(
     )
     mask = mask.triu(1 + past_key_values_length)
 
-    expanded_mask = mask.unsqueeze(0).expand(
-        batch_size, target_length, target_length + past_key_values_length
-    )
+    expanded_mask = mask.unsqueeze(0).expand(batch_size, target_length, target_length + past_key_values_length)
     return expanded_mask
 
 
@@ -111,9 +98,7 @@ def prepare_attn_mask(
     # [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
     expanded_attn_mask = expand_mask(attention_mask, tgt_length=src_length)
     combined_attention_mask = (
-        expanded_attn_mask
-        if combined_attention_mask is None
-        else expanded_attn_mask | combined_attention_mask
+        expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
     )
 
     return combined_attention_mask
@@ -133,7 +118,6 @@ class GPTNeoXAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.num_attention_heads
         self.rotary_ndims = int(self.head_size * config.rotary_pct)
-        max_positions = config.max_position_embeddings
         # ??? TODO
         # self.register_buffer(
         #     "bias",
@@ -147,12 +131,10 @@ class GPTNeoXAttention(nn.Module):
             config.max_position_embeddings,
             base=config.rotary_emb_base,
         )
-        self.rotary_emb.inv_freq = nn.Parameter(
-            weights.get_tensor(f"{prefix}.rotary_emb.inv_freq")
+        self.rotary_emb.inv_freq = nn.Parameter(weights.get_tensor(f"{prefix}.rotary_emb.inv_freq"))
+        self.inv_norm_factor = 1.0 / torch.sqrt(torch.tensor(self.head_size, dtype=torch.float32)).to(
+            torch.get_default_dtype()
         )
-        self.inv_norm_factor = 1.0 / torch.sqrt(
-            torch.tensor(self.head_size, dtype=torch.float32)
-        ).to(torch.get_default_dtype())
 
         if self.num_attention_heads % weights.process_group.size() != 0:
             raise ValueError(
@@ -160,15 +142,11 @@ class GPTNeoXAttention(nn.Module):
                 f"(got `num_attention_heads`: {self.num_attention_heads} "
                 f"and `num_shards`: {weights.process_group.size()}"
             )
-        self.num_attention_heads = (
-            self.num_attention_heads // weights.process_group.size()
-        )
+        self.num_attention_heads = self.num_attention_heads // weights.process_group.size()
         self.query_key_value = TensorParallelColumnLinear.load(
             config, prefix=f"{prefix}.query_key_value", weights=weights, bias=True
         )
-        self.dense = TensorParallelRowLinear.load(
-            config, prefix=f"{prefix}.dense", weights=weights, bias=True
-        )
+        self.dense = TensorParallelRowLinear.load(config, prefix=f"{prefix}.dense", weights=weights, bias=True)
 
     def forward(
         self,
@@ -230,14 +208,10 @@ class GPTNeoXAttention(nn.Module):
             present = (key, value) if use_cache else None
 
             # Compute attention
-            attn_output, attn_weights = self._attn(
-                query, key, value, attention_mask, head_mask
-            )
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
             # Reshape outputs
-            attn_output = self._merge_heads(
-                attn_output, self.num_attention_heads, self.head_size
-            )
+            attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_size)
 
         attn_output = self.dense(attn_output)
 
@@ -268,9 +242,7 @@ class GPTNeoXAttention(nn.Module):
         # tensor [bs, num_attention_heads, seq_len, attn_head_size]
         tensor = tensor.permute(0, 2, 1, 3).contiguous()
         # -> [bs, seq_len, num_attention_heads, attn_head_size]
-        tensor = tensor.view(
-            tensor.size(0), tensor.size(1), num_attention_heads * attn_head_size
-        )
+        tensor = tensor.view(tensor.size(0), tensor.size(1), num_attention_heads * attn_head_size)
         # -> [bs, seq_len, hidden_size]
         return tensor
 
@@ -280,9 +252,7 @@ class GPTNeoXAttention(nn.Module):
         batch_size, num_attention_heads, query_length, attn_head_size = query.size()
         key_length = key.size(-2)
 
-        query = query.view(
-            batch_size * num_attention_heads, query_length, attn_head_size
-        )
+        query = query.view(batch_size * num_attention_heads, query_length, attn_head_size)
         key = key.view(batch_size * num_attention_heads, key_length, attn_head_size)
         attn_scores = torch.zeros(
             1,
@@ -301,12 +271,8 @@ class GPTNeoXAttention(nn.Module):
         input_dtype = attn_scores.dtype
         if input_dtype in [torch.float16, torch.bfloat16]:
             attn_scores = attn_scores.to(torch.float)
-        attn_scores = torch.where(
-            attention_mask, torch.finfo(attn_scores.dtype).min, attn_scores
-        )
-        attn_scores = attn_scores.view(
-            batch_size, num_attention_heads, query_length, key_length
-        )
+        attn_scores = torch.where(attention_mask, torch.finfo(attn_scores.dtype).min, attn_scores)
+        attn_scores = attn_scores.view(batch_size, num_attention_heads, query_length, key_length)
 
         attn_weights = nn.functional.softmax(attn_scores, dim=-1)
         attn_weights = attn_weights.to(value.dtype)
@@ -322,9 +288,7 @@ class GPTNeoXAttention(nn.Module):
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings, base=10000, device=None):
         super().__init__()
-        self.true_inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2).float().to(device) / dim)
-        )
+        self.true_inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
         self.register_buffer("inv_freq", self.true_inv_freq)
 
         # Build here to make `torch.jit.trace` work.
@@ -341,9 +305,7 @@ class RotaryEmbedding(torch.nn.Module):
 
     @staticmethod
     def _create_cos_sin(inv_freq, max_position_embeddings, dtype, device):
-        t = torch.arange(
-            max_position_embeddings, device=inv_freq.device, dtype=inv_freq.dtype
-        )
+        t = torch.arange(max_position_embeddings, device=inv_freq.device, dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -351,11 +313,7 @@ class RotaryEmbedding(torch.nn.Module):
 
     def forward(self, q, k, position_ids, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if (
-            seq_len > self.max_seq_len_cached
-            or self.cos_cached is None
-            or self.sin_cached is None
-        ):
+        if seq_len > self.max_seq_len_cached or self.cos_cached is None or self.sin_cached is None:
             if seq_len > self.max_seq_len_cached:
                 self.max_seq_len_cached = seq_len
             self.cos_cached, self.sin_cached = self._create_cos_sin(
@@ -417,12 +375,8 @@ class GPTNeoXLayer(nn.Module):
             weights=weights,
             eps=config.layer_norm_eps,
         )
-        self.attention = GPTNeoXAttention(
-            config, prefix=f"gpt_neox.layers.{layer_id}.attention", weights=weights
-        )
-        self.mlp = GPTNeoXMLP(
-            config, prefix=f"gpt_neox.layers.{layer_id}.mlp", weights=weights
-        )
+        self.attention = GPTNeoXAttention(config, prefix=f"gpt_neox.layers.{layer_id}.attention", weights=weights)
+        self.mlp = GPTNeoXMLP(config, prefix=f"gpt_neox.layers.{layer_id}.mlp", weights=weights)
 
     def forward(
         self,
@@ -443,9 +397,7 @@ class GPTNeoXLayer(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
         )
-        attn_output = attention_layer_outputs[
-            0
-        ]  # output_attn: attn_output, present, (attn_weights)
+        attn_output = attention_layer_outputs[0]  # output_attn: attn_output, present, (attn_weights)
         outputs = attention_layer_outputs[1:]
 
         if self.use_parallel_residual:
@@ -462,9 +414,7 @@ class GPTNeoXLayer(nn.Module):
             hidden_states = mlp_output + attn_output
 
         if use_cache:
-            outputs = (
-                hidden_states,
-            ) + outputs  # hidden_states, present, (attn_weights)
+            outputs = (hidden_states,) + outputs  # hidden_states, present, (attn_weights)
         else:
             outputs = (hidden_states,) + outputs[1:]  # hidden_states, (attn_weights)
 
@@ -478,14 +428,9 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
 
         self.num_attention_heads = config.num_attention_heads
 
-        self.embed_in = TensorParallelEmbedding(
-            prefix="gpt_neox.embed_in", weights=weights
-        )
+        self.embed_in = TensorParallelEmbedding(prefix="gpt_neox.embed_in", weights=weights)
         self.layers = nn.ModuleList(
-            [
-                GPTNeoXLayer(layer_id, config, weights)
-                for layer_id in range(config.num_hidden_layers)
-            ]
+            [GPTNeoXLayer(layer_id, config, weights) for layer_id in range(config.num_hidden_layers)]
         )
         self.final_layer_norm = nn.LayerNorm.load(
             prefix="gpt_neox.final_layer_norm",
@@ -517,25 +462,15 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
             `past_key_values`).
         """
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
             input_shape = input_ids.size()
         elif inputs_embeds is not None:
@@ -553,9 +488,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_length, seq_length + past_length, dtype=torch.long, device=device
-            )
+            position_ids = torch.arange(past_length, seq_length + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
@@ -572,9 +505,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             past_key_values_length = past_key_values[0][0].shape[-1]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), device=hidden_states.device
-            )
+            attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
         else:
             attention_mask = attention_mask.to(hidden_states.device)
 
@@ -623,11 +554,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, presents, all_hidden_states, all_attentions]
-                if v is not None
-            )
+            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_attentions] if v is not None)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -642,10 +569,9 @@ class GPTNeoxForCausalLM(GPTNeoXPreTrainedModel):
 
     def __init__(self, config, weights):
         super().__init__(config)
+        self.config = config
         self.gpt_neox = GPTNeoXModel(config, weights)
-        self.embed_out = TensorParallelHead.load(
-            config, prefix="embed_out", weights=weights
-        )
+        self.embed_out = TensorParallelHead.load(config, prefix="embed_out", weights=weights)
 
     def forward(
         self,
@@ -700,9 +626,7 @@ class GPTNeoxForCausalLM(GPTNeoXPreTrainedModel):
 
         >>> prediction_logits = outputs.logits
         ```"""
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.gpt_neox(
             input_ids,
@@ -728,9 +652,7 @@ class GPTNeoxForCausalLM(GPTNeoXPreTrainedModel):
             shift_logits = lm_logits[:, :-1, :].contiguous()
             labels = labels[:, 1:].contiguous()
             loss_fct = CrossEntropyLoss()
-            lm_loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), labels.view(-1)
-            )
+            lm_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), labels.view(-1))
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
@@ -790,10 +712,6 @@ class GPTNeoxForCausalLM(GPTNeoXPreTrainedModel):
         reordered_past = ()
         for layer_past in past_key_values:
             reordered_past += (
-                tuple(
-                    past_state.index_select(0, beam_idx)
-                    for past_state in layer_past[:2]
-                )
-                + layer_past[2:],
+                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
             )
         return reordered_past

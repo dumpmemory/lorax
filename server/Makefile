@@ -1,6 +1,9 @@
 include Makefile-flash-att
 include Makefile-flash-att-v2
 include Makefile-vllm
+include Makefile-megablocks
+include Makefile-eetq
+include Makefile-awq
 
 unit-tests:
 	pytest -s -vv -m "not private" tests
@@ -14,14 +17,11 @@ gen-server:
 	find lorax_server/pb/ -type f -name "*.py" -print0 -exec sed -i -e 's/^\(import.*pb2\)/from . \1/g' {} \;
 	touch lorax_server/pb/__init__.py
 
-install-torch:
-	# Install specific version of torch
-	pip install torch --extra-index-url https://download.pytorch.org/whl/cu118 --no-cache-dir
-
-install: gen-server install-torch
+install: gen-server
 	pip install pip --upgrade
+	pip install torch==2.4.0
 	pip install -r requirements.txt
-	pip install -e ".[bnb, accelerate]"
+	pip install -e ".[bnb, accelerate, quantize, peft, outlines]"
 
 run-dev:
 	# SAFETENSORS_FAST_GPU=1 python -m torch.distributed.run --nproc_per_node=1 lorax_server/cli.py serve gpt2
@@ -31,4 +31,9 @@ run-dev:
 	# SAFETENSORS_FAST_GPU=1 python -m torch.distributed.run --nproc_per_node=1 lorax_server/cli.py serve flozi00/Mistral-7B-german-assistant-v5-4bit-autogptq --quantize gptq
 
 export-requirements:
-	poetry export -o requirements.txt -E bnb -E quantize --without-hashes
+	poetry export -o requirements.txt --without-hashes
+
+format:
+	pip install ruff
+	python -m ruff format lorax_server
+	python -m ruff check lorax_server --fix

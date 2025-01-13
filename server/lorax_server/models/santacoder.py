@@ -1,10 +1,10 @@
+from typing import List, Optional
+
 import torch
 import torch.distributed
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from typing import Optional, List
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-from lorax_server.models import CausalLM
+from lorax_server.models.causal_lm import CausalLM
 
 FIM_PREFIX = "<fim-prefix>"
 FIM_MIDDLE = "<fim-middle>"
@@ -19,9 +19,13 @@ class SantaCoder(CausalLM):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        compile: bool = False,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
+        if compile:
+            raise ValueError("`--compile` is not supported with SantaCoder")
+
         if torch.cuda.is_available():
             device = torch.device("cuda")
             dtype = torch.float16 if dtype is None else dtype
@@ -61,15 +65,15 @@ class SantaCoder(CausalLM):
             )
 
         super(CausalLM, self).__init__(
+            model_id=model_id,
             model=model,
             tokenizer=tokenizer,
             requires_padding=True,
             dtype=dtype,
             device=device,
+            trust_remote_code=trust_remote_code,
         )
 
     def decode(self, generated_ids: List[int]) -> str:
         # Do not skip special tokens as they are used for custom parsing rules of the generated text
-        return self.tokenizer.decode(
-            generated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
-        )
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)

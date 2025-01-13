@@ -1,4 +1,4 @@
-name: Build and push docker image to ghcr
+name: Build and push docker image to ghcr and run integration tests
 
 on:
   workflow_dispatch:
@@ -6,14 +6,14 @@ on:
     branches:
       - 'main'
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
-  build-and-push-image:
+  build-test-push-image:
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.head_ref || github.run_id }}
       cancel-in-progress: true
-    runs-on: a100-runner
+    runs-on: a100-40gb-runner
     permissions:
       contents: write
       packages: write
@@ -23,6 +23,13 @@ jobs:
       security-events: write
 
     steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
@@ -41,8 +48,8 @@ jobs:
       - name: Install soci
         uses: lerentis/soci-installer@v1.0.1
         with:
-          soci-release: 'v0.4.0'
-      
+          soci-release: "v0.4.0"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2.10.0
 
@@ -51,22 +58,19 @@ jobs:
         with:
           config-inline: |
             version = 2
-            
-            # persistent data location
-            root = "/var/lib/kubelet/containerd"
 
-      - name: Docker meta
+            # persistent data location
+            root = "/runner/build/containerd"
+
+      - name: Generate SHA tag
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
             ghcr.io/predibase/lorax
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=,suffix=,format=short
-            type=raw,value=latest
-      
+
       - name: Create a hash from tags
         env:
           tags: ${{ steps.meta.outputs.tags }}
@@ -74,9 +78,9 @@ jobs:
         run: |
           tag_hash=$(echo -n "$tags" | md5sum | awk '{print $1}')
           echo "tag_hash=$tag_hash" >> $GITHUB_OUTPUT
-          echo "cache_dir=/var/lib/kubelet/images/cache" >> $GITHUB_OUTPUT
-          echo "image_dir=/var/lib/kubelet/images" >> $GITHUB_OUTPUT
-          echo "image_path=/var/lib/kubelet/images/lorax" >> $GITHUB_OUTPUT
+          echo "cache_dir=/runner/build/images/cache" >> $GITHUB_OUTPUT
+          echo "image_dir=/runner/build/images" >> $GITHUB_OUTPUT
+          echo "image_path=/runner/build/images/lorax" >> $GITHUB_OUTPUT
 
       - name: Create and update image/cache directory
         env:
@@ -93,12 +97,29 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile  # Path to your Dockerfile
+          file: ./Dockerfile # Path to your Dockerfile
           push: false
           tags: ${{ steps.meta.outputs.tags }}
+          load: true
           outputs: type=oci,compression=gzip,dest=${{ steps.vars.outputs.image_path }}-${{ steps.vars.outputs.tag_hash }}.tar.gz
           cache-from: type=local,src=${{ steps.vars.outputs.cache_dir }}
           cache-to: type=local,mode=max,image-manifest=true,oci-mediatypes=true,dest=${{ steps.vars.outputs.cache_dir }}
+
+      # Uncomment below and comment the "Export Docker image as OCI" step
+      # to test this workflow with an old image. This is useful for testing
+      # the integration tests workflow without waiting for a new image to be built.
+
+      # - name: Pull and retag an old image for testing with meta output tags
+      #   env:
+      #     tags: ${{ steps.meta.outputs.tags }}
+      #   run: |
+      #     # Read the first tag from meta output
+      #     docker pull ghcr.io/predibase/lorax:main
+      #     # Tag with all the meta output tags
+      #     while IFS= read -r tag; do
+      #       echo "Tagging $tag"
+      #       docker tag ghcr.io/predibase/lorax:main "$tag"
+      #     done <<< "$tags"
 
       - name: Import image in containerd
         env:
@@ -107,13 +128,6 @@ jobs:
         run: |
           echo "Importing $image_path-$tag_hash to Containerd"
           sudo ctr i import --no-unpack --all-platforms --digests $image_path-$tag_hash.tar.gz
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v1
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_PAT }}
 
       - name: Push image with containerd
         env:
@@ -124,7 +138,7 @@ jobs:
             echo "Pushing $tag to GHCR"
             sudo ctr i push --user "${{ github.repository_owner }}:${{ secrets.GHCR_PAT }}" $tag
           done
-      
+
       - name: Create and push soci index
         env:
           tags: ${{ steps.meta.outputs.tags }}
@@ -137,6 +151,42 @@ jobs:
             echo "Pushing soci index for $tag"
             sudo $SOCI_PATH push --user ${{ github.repository_owner }}:${{ secrets.GHCR_PAT }} $tag
           done
+
+      - name: Run integration tests
+        id: integration_tests
+        uses: ./.github/workflows/integration-tests
+        with:
+          test_image_tag: ${{ steps.meta.outputs.tags }}
+          use_local_image: true
+          github_token: ${{ secrets.GHCR_PAT }}
+          huggingface_token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+
+      - name: Final Tags
+        id: final_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/predibase/lorax
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=,suffix=,format=short
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Tag the image with rest of the tags and push
+        env:
+          sha_tag: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.final_meta.outputs.tags }}
+        run: |
+          # Read the first tag from meta output
+          docker pull $sha_tag
+          # Tag with all the meta output tags
+          while IFS= read -r tag; do
+            echo "Tagging $tag and pushing"
+            docker tag $sha_tag "$tag"
+            docker push "$tag"
+            echo "Pushed $tag"
+          done <<< "$tags"
 
       - name: Prune older images
         env:
@@ -151,4 +201,3 @@ jobs:
 
           # Delete the SHA image(s) from containerd store
           sudo ctr i rm $(sudo ctr i ls -q)
-  

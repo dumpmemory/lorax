@@ -1,20 +1,20 @@
-import time
-import torch.nn as nn
-import math
 import json
+import math
 import os
-import torch
-import transformers
-
-from texttable import Texttable
-from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
-from huggingface_hub import HfApi
-from accelerate import init_empty_weights
-from lorax_server.utils import initialize_torch_distributed, Weights
-from lorax_server.utils import weight_files
-from lorax_server.utils.gptq.quant_linear import QuantLinear
-from loguru import logger
+import time
 from typing import Optional
+
+import torch
+import torch.nn as nn
+import transformers
+from accelerate import init_empty_weights
+from huggingface_hub import HfApi
+from loguru import logger
+from texttable import Texttable
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from lorax_server.utils import Weights, initialize_torch_distributed, weight_files
+from lorax_server.utils.gptq.quant_linear import QuantLinear
 
 DEV = torch.device("cuda:0")
 
@@ -104,9 +104,7 @@ class Quantizer(nn.Module):
                 xmax1 = p * xmax
                 scale1 = (xmax1 - xmin1) / self.maxq
                 zero1 = torch.round(-xmin1 / scale1) if not self.sym else self.zero
-                q = self._quantize(
-                    x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq
-                )
+                q = self._quantize(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq)
                 q -= x
                 q.abs_()
                 q.pow_(self.norm)
@@ -180,9 +178,7 @@ class GPTQ:
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(
-            self.layer, transformers.Conv1D
-        ):
+        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
@@ -206,18 +202,12 @@ class GPTQ:
     def print_loss(self, name, q_weight, weight_error, timecost):
         table = Texttable()
         length = 28
-        name = (
-            (name + " " * (length - len(name)))
-            if len(name) <= length
-            else name[:length]
-        )
+        name = (name + " " * (length - len(name))) if len(name) <= length else name[:length]
 
         table.header(["name", "weight_error", "fp_inp_SNR", "q_inp_SNR", "time"])
 
         # assign weight
-        self.layer.weight.data = q_weight.reshape(self.layer.weight.shape).to(
-            self.layer.weight.data.dtype
-        )
+        self.layer.weight.data = q_weight.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
 
         if self.inp1 is not None:
             # quantize input to int8
@@ -228,8 +218,8 @@ class GPTQ:
             q_out = self.layer(q_in)
 
             # get kinds of SNR
-            q_SNR = torch_snr_error(q_out, self.out1).item()
-            fp_SNR = torch_snr_error(self.layer(self.inp1), self.out1).item()
+            q_SNR = torch_snr_error(q_out, self.out1).item()  # noqa: F821
+            fp_SNR = torch_snr_error(self.layer(self.inp1), self.out1).item()  # noqa: F821
         else:
             q_SNR = "-"
             fp_SNR = "-"
@@ -237,9 +227,7 @@ class GPTQ:
         table.add_row([name, weight_error, fp_SNR, q_SNR, timecost])
         print(table.draw().split("\n")[-2])
 
-    def fasterquant(
-        self, blocksize=128, percdamp=0.01, groupsize=-1, act_order=False, name=""
-    ):
+    def fasterquant(self, blocksize=128, percdamp=0.01, groupsize=-1, act_order=False, name=""):
         self.layer.to(self.dev)
 
         W = self.layer.weight.data.clone()
@@ -278,9 +266,7 @@ class GPTQ:
             H = torch.linalg.cholesky(H, upper=True)
         except Exception:
             # Addition because Falcon fails on h_to_4h
-            H = torch.linalg.cholesky(
-                H + 1e-5 * torch.eye(H.shape[0]).to(H.device), upper=True
-            )
+            H = torch.linalg.cholesky(H + 1e-5 * torch.eye(H.shape[0]).to(H.device), upper=True)
         Hinv = H
 
         g_idx = []
@@ -304,9 +290,7 @@ class GPTQ:
 
                 if groupsize != -1:
                     if (i1 + i) % groupsize == 0:
-                        self.quantizer.find_params(
-                            W[:, (i1 + i) : (i1 + i + groupsize)], weight=True
-                        )
+                        self.quantizer.find_params(W[:, (i1 + i) : (i1 + i + groupsize)], weight=True)
 
                     if ((i1 + i) // groupsize) - now_idx == -1:
                         scale.append(self.quantizer.scale)
@@ -340,9 +324,7 @@ class GPTQ:
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
 
-        self.print_loss(
-            name=name, q_weight=Q, weight_error=error, timecost=(time.time() - tick)
-        )
+        self.print_loss(name=name, q_weight=Q, weight_error=error, timecost=(time.time() - tick))
 
         if scale == []:
             scale.append(self.quantizer.scale)
@@ -396,7 +378,7 @@ def get_ptb(nsamples, seed, seqlen, model_id):
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
-    except:
+    except Exception:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     trainenc = tokenizer("\n\n".join(traindata["sentence"]), return_tensors="pt")
     testenc = tokenizer("\n\n".join(valdata["sentence"]), return_tensors="pt")
@@ -437,7 +419,7 @@ def get_c4(nsamples, seed, seqlen, model_id):
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
-    except:
+    except Exception:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
 
     import random
@@ -491,7 +473,7 @@ def get_ptb_new(nsamples, seed, seqlen, model_id):
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
-    except:
+    except Exception:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     trainenc = tokenizer(" ".join(traindata["sentence"]), return_tensors="pt")
     testenc = tokenizer(" ".join(testdata["sentence"]), return_tensors="pt")
@@ -530,7 +512,7 @@ def get_c4_new(nsamples, seed, seqlen, model_id):
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
-    except:
+    except Exception:
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
 
     import random
@@ -582,11 +564,7 @@ def find_layers(module, layers=(nn.Conv2d, nn.Linear), name=""):
         return {name: module}
     res = {}
     for name1, child in module.named_children():
-        res.update(
-            find_layers(
-                child, layers=layers, name=name + "." + name1 if name != "" else name1
-            )
-        )
+        res.update(find_layers(child, layers=layers, name=name + "." + name1 if name != "" else name1))
     return res
 
 
@@ -616,9 +594,7 @@ def sequential(
         prefix = "transformer.h"
 
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
+    inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
 
     cache = {"i": 0}
     extra = {}
@@ -651,9 +627,7 @@ def sequential(
 
     outs = torch.zeros_like(inps)
 
-    extra = {
-        k: v.to(dev) if isinstance(v, torch.Tensor) else v for k, v in extra.items()
-    }
+    extra = {k: v.to(dev) if isinstance(v, torch.Tensor) else v for k, v in extra.items()}
 
     print("Ready.")
 
@@ -674,14 +648,12 @@ def sequential(
             gptq = {}
             for name in subset:
                 gptq[name] = GPTQ(subset[name])
-                gptq[name].quantizer.configure(
-                    bits, perchannel=True, sym=sym, mse=False
-                )
+                gptq[name].quantizer.configure(bits, perchannel=True, sym=sym, mse=False)
                 pass
 
             def add_batch(name):
                 def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
+                    gptq[name].add_batch(inp[0].data, out.data)  # noqa: F821
 
                 return tmp
 
@@ -748,9 +720,7 @@ def make_quant_linear(module, names, bits, groupsize, name=""):
                 ),
             )
     for name1, child in module.named_children():
-        make_quant_linear(
-            child, names, bits, groupsize, name + "." + name1 if name != "" else name1
-        )
+        make_quant_linear(child, names, bits, groupsize, name + "." + name1 if name != "" else name1)
 
 
 # TODO: perform packing on GPU
@@ -859,9 +829,7 @@ def quantize(
     )
 
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(
-            config, torch_dtype=torch.float16, trust_remote_code=trust_remote_code
-        )
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16, trust_remote_code=trust_remote_code)
     model = model.eval()
 
     print("LOADED model")
@@ -885,29 +853,21 @@ def quantize(
 
         def unload(module, name):
             def _unload():
-                load_weights_post_hook(name, weights, recursive=True)(
-                    module, None, None
-                )
+                load_weights_post_hook(name, weights, recursive=True)(module, None, None)
 
             return _unload
 
         module.load = load(module, name)
         module.unload = unload(module, name)
-        hooks.append(
-            module.register_forward_pre_hook(load_weights_pre_hook(name, weights))
-        )
-        hooks.append(
-            module.register_forward_hook(load_weights_post_hook(name, weights))
-        )
+        hooks.append(module.register_forward_pre_hook(load_weights_pre_hook(name, weights)))
+        hooks.append(module.register_forward_hook(load_weights_post_hook(name, weights)))
     model.seqlen = 2048
 
     dataset = "wikitext2"
     nsamples = 128
     seed = None
 
-    dataloader, testloader = get_loaders(
-        dataset, nsamples=nsamples, seed=seed, model_id=model_id, seqlen=model.seqlen
-    )
+    dataloader, testloader = get_loaders(dataset, nsamples=nsamples, seed=seed, model_id=model_id, seqlen=model.seqlen)
 
     tick = time.time()
     quantizers = sequential(
@@ -933,9 +893,7 @@ def quantize(
     state_dict["gptq_groupsize"] = torch.LongTensor([groupsize])
 
     max_shard_size = "10GB"
-    shards, index = shard_checkpoint(
-        state_dict, max_shard_size=max_shard_size, weights_name="model.safetensors"
-    )
+    shards, index = shard_checkpoint(state_dict, max_shard_size=max_shard_size, weights_name="model.safetensors")
     os.makedirs(output_dir, exist_ok=True)
     for shard_file, shard in shards.items():
         save_file(
@@ -965,15 +923,11 @@ def quantize(
     config.save_pretrained(output_dir)
     logger.info("Saved config")
     logger.info("Saving tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id, trust_remote_code=trust_remote_code
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
     tokenizer.save_pretrained(output_dir)
     logger.info("Saved tokenizer")
 
     if upload_to_model_id:
         api = HfApi()
 
-        api.upload_folder(
-            folder_path=output_dir, repo_id=upload_to_model_id, repo_type="model"
-        )
+        api.upload_folder(folder_path=output_dir, repo_id=upload_to_model_id, repo_type="model")

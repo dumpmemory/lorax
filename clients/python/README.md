@@ -126,6 +126,8 @@ class Parameters:
     watermark: bool
     # Get decoder input token logprobs and ids
     decoder_input_details: bool
+    # The number of highest probability vocabulary tokens to return as alternative tokens in the generation result
+    return_k_alternatives: Optional[int]
 
 # Decoder input tokens
 class InputToken:
@@ -181,6 +183,8 @@ class BestOfSequence:
 class Details:
     # Generation finish reason
     finish_reason: FinishReason
+    # Number of prompt tokens
+    prompt_tokens: int
     # Number of generated tokens
     generated_tokens: int
     # Sampling seed if sampling was activated
@@ -205,6 +209,8 @@ class Response:
 class StreamDetails:
     # Generation finish reason
     finish_reason: FinishReason
+    # Number of prompt tokens
+    prompt_tokens: int
     # Number of generated tokens
     generated_tokens: int
     # Sampling seed if sampling was activated

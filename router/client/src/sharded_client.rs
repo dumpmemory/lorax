@@ -1,5 +1,9 @@
+use crate::pb::generate::v1::{ClassifyPredictionList, Embedding};
 /// Multi shard Client
-use crate::{Batch, CachedBatch, Client, Generation, HealthResponse, ShardInfo};
+use crate::{
+    AdapterParameters, Batch, CachedBatch, Client, DownloadAdapterResponse, Generation,
+    HealthResponse, ShardInfo,
+};
 use crate::{ClientError, Result};
 use futures::future::join_all;
 use tonic::transport::Uri;
@@ -95,11 +99,14 @@ impl ShardedClient {
         &mut self,
         max_input_length: u32,
         max_prefill_tokens: u32,
+        max_total_tokens: u32,
     ) -> Result<Option<u32>> {
         let futures: Vec<_> = self
             .clients
             .iter_mut()
-            .map(|client| Box::pin(client.warmup(max_input_length, max_prefill_tokens)))
+            .map(|client| {
+                Box::pin(client.warmup(max_input_length, max_prefill_tokens, max_total_tokens))
+            })
             .collect();
         // Take the minimum value
         let results = join_all(futures)
@@ -117,11 +124,12 @@ impl ShardedClient {
     pub async fn prefill(
         &mut self,
         batch: Batch,
+        cached_batch: Option<CachedBatch>,
     ) -> Result<(Vec<Generation>, Option<CachedBatch>)> {
         let futures: Vec<_> = self
             .clients
             .iter_mut()
-            .map(|client| Box::pin(client.prefill(batch.clone())))
+            .map(|client| Box::pin(client.prefill(batch.clone(), cached_batch.clone())))
             .collect();
         let results: Result<Vec<(Vec<Generation>, Option<CachedBatch>)>> =
             join_all(futures).await.into_iter().collect();
@@ -147,32 +155,61 @@ impl ShardedClient {
         merge_generations(results?)
     }
 
+    /// Embed the given batch
+    #[instrument(skip(self))]
+    pub async fn embed(&mut self, batch: Batch) -> Result<Vec<Embedding>> {
+        let futures: Vec<_> = self
+            .clients
+            .iter_mut()
+            .map(|client| Box::pin(client.embed(batch.clone())))
+            .collect();
+        let results: Result<Vec<Vec<Embedding>>> = join_all(futures).await.into_iter().collect();
+        Ok(results?.into_iter().flatten().collect())
+    }
+
+    /// Classify the given batch
+    #[instrument(skip(self))]
+    pub async fn classify(&mut self, batch: Batch) -> Result<Vec<ClassifyPredictionList>> {
+        let futures: Vec<_> = self
+            .clients
+            .iter_mut()
+            .map(|client| Box::pin(client.classify(batch.clone())))
+            .collect();
+        let results: Result<Vec<Vec<ClassifyPredictionList>>> =
+            join_all(futures).await.into_iter().collect();
+
+        Ok(results?.into_iter().flatten().collect())
+    }
+
     pub async fn download_adapter(
         &mut self,
-        adapter_id: String,
+        adapter_parameters: AdapterParameters,
         adapter_source: String,
-    ) -> Result<String> {
+        api_token: Option<String>,
+    ) -> Result<DownloadAdapterResponse> {
         // Only download the adapter with one client, since they share a single disk
         self.clients[0]
-            .download_adapter(adapter_id, adapter_source)
+            .download_adapter(adapter_parameters, adapter_source, api_token)
             .await
     }
 
     pub async fn load_adapter(
         &mut self,
-        adapter_id: String,
+        adapter_parameters: AdapterParameters,
         adapter_source: String,
         adapter_index: u32,
-    ) -> Result<String> {
+        api_token: Option<String>,
+    ) -> Result<bool> {
         // Load the adapter in all clients since there is sharding done between them
         let futures: Vec<_> = self
             .clients
             .iter_mut()
             .map(|client| {
                 Box::pin(client.load_adapter(
-                    adapter_id.clone(),
+                    adapter_parameters.clone(),
                     adapter_source.clone(),
                     adapter_index,
+                    api_token.clone(),
                 ))
             })
             .collect();
@@ -180,7 +217,7 @@ impl ShardedClient {
         match join_all(futures)
             .await
             .into_iter()
-            .collect::<Result<Vec<String>>>()
+            .collect::<Result<Vec<bool>>>()
         {
             Ok(mut results) => {
                 // Return the first adapter id
@@ -192,17 +229,17 @@ impl ShardedClient {
 
     pub async fn offload_adapter(
         &mut self,
-        adapter_id: String,
+        adapter_parameters: AdapterParameters,
         adapter_source: String,
         adapter_index: u32,
-    ) -> Result<String> {
+    ) -> Result<bool> {
         // Load the adapter in all clients since there is sharding done between them
         let futures: Vec<_> = self
             .clients
             .iter_mut()
             .map(|client| {
                 Box::pin(client.offload_adapter(
-                    adapter_id.clone(),
+                    adapter_parameters.clone(),
                     adapter_source.clone(),
                     adapter_index,
                 ))
@@ -212,7 +249,7 @@ impl ShardedClient {
         match join_all(futures)
             .await
             .into_iter()
-            .collect::<Result<Vec<String>>>()
+            .collect::<Result<Vec<bool>>>()
         {
             Ok(mut results) => {
                 // Return the first adapter id

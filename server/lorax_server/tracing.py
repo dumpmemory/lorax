@@ -1,16 +1,15 @@
 import grpc
-
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.grpc._aio_server import (
     OpenTelemetryAioServerInterceptor,
 )
-from opentelemetry.semconv.trace import SpanAttributes
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
 )
+from opentelemetry.semconv.trace import SpanAttributes
 
 
 class UDSOpenTelemetryAioServerInterceptor(OpenTelemetryAioServerInterceptor):
@@ -55,9 +54,7 @@ class UDSOpenTelemetryAioServerInterceptor(OpenTelemetryAioServerInterceptor):
 
 
 def setup_tracing(shard: int, otlp_endpoint: str):
-    resource = Resource.create(
-        attributes={"service.name": f"lorax.server-{shard}"}
-    )
+    resource = Resource.create(attributes={"service.name": f"lorax.server-{shard}"})
     span_exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
     span_processor = BatchSpanProcessor(span_exporter)
 

@@ -2,22 +2,21 @@ use crate::adapter::Adapter;
 use crate::infer::InferError;
 use crate::queue::{AdapterQueuesState, AdapterStatus};
 use lorax_client::ShardedClient;
-use std::sync::Mutex;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::Span;
 
 /// Request AdapterLoader
 #[derive(Debug, Clone)]
 pub(crate) struct AdapterLoader {
     /// Channel to communicate with the background task
-    sender: flume::Sender<AdapterLoaderCommand>,
+    sender: mpsc::UnboundedSender<AdapterLoaderCommand>,
 }
 
 impl AdapterLoader {
     pub(crate) fn new(client: ShardedClient) -> Self {
         // Create channel
-        let (sender, receiver) = flume::unbounded();
+        let (sender, receiver) = mpsc::unbounded_channel();
 
         // Launch background queue task
         tokio::spawn(loader_task(client, receiver));
@@ -84,6 +83,7 @@ impl AdapterLoader {
         // response_receiver.await.unwrap()
     }
 
+    #[allow(dead_code)] // cuurently unused
     pub(crate) async fn is_errored(&self, adapter: Adapter) -> bool {
         // Create response channel
         let (response_sender, response_receiver) = oneshot::channel();
@@ -115,47 +115,54 @@ impl AdapterLoader {
 }
 
 // Background task responsible of the loader state
-async fn loader_task(mut client: ShardedClient, receiver: flume::Receiver<AdapterLoaderCommand>) {
+async fn loader_task(
+    mut client: ShardedClient,
+    mut receiver: mpsc::UnboundedReceiver<AdapterLoaderCommand>,
+) {
     let mut err_msgs: HashMap<Adapter, String> = HashMap::new();
 
-    while let Ok(cmd) = receiver.recv_async().await {
+    while let Some(cmd) = receiver.recv().await {
         match cmd {
             AdapterLoaderCommand::DownloadAdapter {
                 adapter,
                 queues_state,
-                response_sender,
+                response_sender: _,
                 span: _, // TODO(geoffrey): not sure how to use 'span' with async fn
             } => {
                 if err_msgs.contains_key(&adapter) {
                     metrics::increment_counter!("lorax_request_failure", "err" => "download_adapter");
-                    let mut locked_state = queues_state.lock().unwrap();
+                    let mut locked_state = queues_state.lock().await;
                     if locked_state.has_adapter(&adapter) {
                         // Above check guards against the case where the adapter was terminated between the initial
                         // time of request and the time of adapter download
                         locked_state.set_status(&adapter, AdapterStatus::Errored);
                     }
-                    // response_sender.send(()).unwrap();
                     continue;
                 }
 
                 match client
-                    .download_adapter(adapter.id().to_string(), adapter.source().to_string())
+                    .download_adapter(
+                        adapter.params().clone().into(),
+                        adapter.source().to_string(),
+                        adapter.api_token().clone(),
+                    )
                     .await
                 {
-                    Ok(_) => {
-                        tracing::info!("adapter {} downloaded", adapter.id());
-                        let mut locked_state = queues_state.lock().unwrap();
+                    Ok(resp) => {
+                        tracing::info!("adapter {} downloaded", adapter.as_string());
+                        let mut locked_state = queues_state.lock().await;
                         if locked_state.has_adapter(&adapter) {
                             // Above check guards against the case where the adapter was terminated between the initial
                             // time of request and the time of adapter download
+                            locked_state.set_cost(&adapter, resp.memory_fraction);
                             locked_state.set_status(&adapter, AdapterStatus::Downloaded);
                         }
                     }
                     // if we have a download error, we send an error to the entry response
                     Err(error) => {
-                        tracing::info!("FAILED downloading adapter {}", adapter.id());
+                        tracing::info!("FAILED downloading adapter {}", adapter.as_string());
                         metrics::increment_counter!("lorax_request_failure", "err" => "download_adapter");
-                        let mut locked_state = queues_state.lock().unwrap();
+                        let mut locked_state = queues_state.lock().await;
                         if locked_state.has_adapter(&adapter) {
                             // Above check guards against the case where the adapter was terminated between the initial
                             // time of request and the time of adapter download
@@ -168,12 +175,12 @@ async fn loader_task(mut client: ShardedClient, receiver: flume::Receiver<Adapte
             AdapterLoaderCommand::LoadAdapter {
                 adapter,
                 queues_state,
-                response_sender,
+                response_sender: _,
                 span: _, // TODO(geoffrey): not sure how to use 'span' with async fn
             } => {
                 if err_msgs.contains_key(&adapter) {
                     metrics::increment_counter!("lorax_request_failure", "err" => "load_adapter");
-                    let mut locked_state = queues_state.lock().unwrap();
+                    let mut locked_state = queues_state.lock().await;
                     if locked_state.has_adapter(&adapter) {
                         locked_state.set_status(&adapter, AdapterStatus::Errored);
                     }
@@ -182,27 +189,28 @@ async fn loader_task(mut client: ShardedClient, receiver: flume::Receiver<Adapte
                 }
                 match client
                     .load_adapter(
-                        adapter.id().to_string(),
+                        adapter.params().clone().into(),
                         adapter.source().to_string(),
                         adapter.index(),
+                        adapter.api_token().clone(),
                     )
                     .await
                 {
                     Ok(_) => {
-                        tracing::info!("adapter {} loaded", adapter.id());
+                        tracing::info!("adapter {} loaded", adapter.as_string());
                         queues_state
                             .lock()
-                            .unwrap()
+                            .await
                             .set_status(&adapter, AdapterStatus::Ready);
                         // response_sender.send(()).unwrap();
                     }
                     // If we have a load error, we send an error to the entry response
                     Err(error) => {
-                        tracing::info!("FAILED loading adapter {}", adapter.id());
+                        tracing::info!("FAILED loading adapter {}", adapter.as_string());
                         metrics::increment_counter!("lorax_request_failure", "err" => "load_adapter");
                         queues_state
                             .lock()
-                            .unwrap()
+                            .await
                             .set_status(&adapter, AdapterStatus::Errored);
                         err_msgs.insert(adapter, error.to_string());
                         // response_sender.send(()).unwrap();
@@ -212,12 +220,12 @@ async fn loader_task(mut client: ShardedClient, receiver: flume::Receiver<Adapte
             AdapterLoaderCommand::OffloadAdapter {
                 adapter,
                 queues_state,
-                response_sender,
+                response_sender: _,
                 span: _, // TODO(geoffrey): not sure how to use 'span' with async fn
             } => {
                 if err_msgs.contains_key(&adapter) {
                     metrics::increment_counter!("lorax_request_failure", "err" => "offload_adapter");
-                    let mut locked_state = queues_state.lock().unwrap();
+                    let mut locked_state = queues_state.lock().await;
                     if locked_state.has_adapter(&adapter) {
                         locked_state.set_status(&adapter, AdapterStatus::Errored);
                     }
@@ -226,27 +234,27 @@ async fn loader_task(mut client: ShardedClient, receiver: flume::Receiver<Adapte
                 }
                 match client
                     .offload_adapter(
-                        adapter.id().to_string(),
+                        adapter.params().clone().into(),
                         adapter.source().to_string(),
                         adapter.index(),
                     )
                     .await
                 {
                     Ok(_) => {
-                        tracing::info!("adapter {} offloaded", adapter.id());
+                        tracing::info!("adapter {} offloaded", adapter.as_string());
                         queues_state
                             .lock()
-                            .unwrap()
+                            .await
                             .set_status(&adapter, AdapterStatus::Downloaded);
                         // response_sender.send(()).unwrap();
                     }
                     // If we have a load error, we send an error to the entry response
                     Err(error) => {
-                        tracing::info!("FAILED offloading adapter {}", adapter.id());
+                        tracing::info!("FAILED offloading adapter {}", adapter.as_string());
                         metrics::increment_counter!("lorax_request_failure", "err" => "offload_adapter");
                         queues_state
                             .lock()
-                            .unwrap()
+                            .await
                             .set_status(&adapter, AdapterStatus::Errored);
                         err_msgs.insert(adapter, error.to_string());
                         // response_sender.send(()).unwrap();
@@ -265,12 +273,12 @@ async fn loader_task(mut client: ShardedClient, receiver: flume::Receiver<Adapte
             AdapterLoaderCommand::Terminate {
                 adapter,
                 queues_state,
-                response_sender,
-                span,
+                response_sender: _,
+                span: _,
             } => {
-                tracing::info!("terminating adapter {} loader", adapter.id());
+                tracing::info!("terminating adapter {} loader", adapter.as_string());
 
-                let mut locked_state = queues_state.lock().unwrap();
+                let mut locked_state = queues_state.lock().await;
                 if !locked_state.has_adapter(&adapter) {
                     err_msgs.remove(&adapter);
                     continue;
@@ -297,21 +305,28 @@ enum AdapterLoaderCommand {
     DownloadAdapter {
         adapter: Adapter,
         queues_state: Arc<Mutex<AdapterQueuesState>>,
+        #[allow(dead_code)] // currently unused
         response_sender: oneshot::Sender<()>,
+        #[allow(dead_code)] // currently unused
         span: Span,
     },
     LoadAdapter {
         adapter: Adapter,
         queues_state: Arc<Mutex<AdapterQueuesState>>,
+        #[allow(dead_code)] // currently unused
         response_sender: oneshot::Sender<()>,
+        #[allow(dead_code)] // currently unused
         span: Span,
     },
     OffloadAdapter {
         adapter: Adapter,
         queues_state: Arc<Mutex<AdapterQueuesState>>,
+        #[allow(dead_code)] // currently unused
         response_sender: oneshot::Sender<()>,
+        #[allow(dead_code)] // currently unused
         span: Span,
     },
+    #[allow(dead_code)]
     IsErrored {
         adapter: Adapter,
         response_sender: oneshot::Sender<bool>,
@@ -320,7 +335,9 @@ enum AdapterLoaderCommand {
     Terminate {
         adapter: Adapter,
         queues_state: Arc<Mutex<AdapterQueuesState>>,
+        #[allow(dead_code)] // currently unused
         response_sender: oneshot::Sender<()>,
+        #[allow(dead_code)] // currently unused
         span: Span,
     },
 }
@@ -357,6 +374,7 @@ enum AdapterLoaderCommand {
 //                     seed: 0,
 //                     repetition_penalty: 0.0,
 //                     watermark: false,
+//                     return_k_alternatives: 0,
 //                 },
 //                 stopping_parameters: StoppingCriteriaParameters {
 //                     ignore_eos_token: false,

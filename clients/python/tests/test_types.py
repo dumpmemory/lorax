@@ -1,6 +1,6 @@
 import pytest
 
-from lorax.types import Parameters, Request
+from lorax.types import Parameters, Request, MergedAdapters
 from lorax.errors import ValidationError
 
 
@@ -31,8 +31,7 @@ def test_parameters_validation():
 
     # Test temperature
     Parameters(temperature=1)
-    with pytest.raises(ValidationError):
-        Parameters(temperature=0)
+    Parameters(temperature=0)
     with pytest.raises(ValidationError):
         Parameters(temperature=-1)
 
@@ -68,6 +67,13 @@ def test_parameters_validation():
     with pytest.raises(ValidationError):
         Parameters(typical_p=1)
 
+    # Test adapter_id and merged_adapters
+    merged_adapters = MergedAdapters(ids=["test/adapter-id-1", "test/adapter-id-2"], weights=[0.5, 0.5], density=0.5)
+    Parameters(adapter_id="test/adapter-id")
+    Parameters(merged_adapters=merged_adapters)
+    with pytest.raises(ValidationError):
+        Parameters(adapter_id="test/adapter-id", merged_adapters=merged_adapters)
+
 
 def test_request_validation():
     Request(inputs="test")
@@ -79,6 +85,4 @@ def test_request_validation():
     Request(inputs="test", parameters=Parameters(best_of=2, do_sample=True))
 
     with pytest.raises(ValidationError):
-        Request(
-            inputs="test", parameters=Parameters(best_of=2, do_sample=True), stream=True
-        )
+        Request(inputs="test", parameters=Parameters(best_of=2, do_sample=True), stream=True)
