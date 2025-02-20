@@ -1,24 +1,21 @@
-import os
-import torch
-
-from loguru import logger
-from transformers.configuration_utils import PretrainedConfig
-from transformers.models.auto import modeling_auto
 from typing import Optional
 
-from lorax_server.models.model import Model
+import torch
+from loguru import logger
+from transformers.configuration_utils import PretrainedConfig
+
+from lorax_server.models.bloom import BLOOMSharded
 from lorax_server.models.causal_lm import CausalLM
 from lorax_server.models.flash_causal_lm import FlashCausalLM
-from lorax_server.models.bloom import BLOOMSharded
-from lorax_server.models.mpt import MPTSharded
-from lorax_server.models.seq2seq_lm import Seq2SeqLM
-from lorax_server.models.rw import RW
-from lorax_server.models.opt import OPTSharded
 from lorax_server.models.galactica import GalacticaSharded
+from lorax_server.models.model import Model
+from lorax_server.models.mpt import MPTSharded
+from lorax_server.models.opt import OPTSharded
 from lorax_server.models.santacoder import SantaCoder
+from lorax_server.models.seq2seq_lm import Seq2SeqLM
 from lorax_server.models.t5 import T5Sharded
-from lorax_server.models.gpt_neox import GPTNeoxSharded
 from lorax_server.utils.sources import get_s3_model_local_dir
+from lorax_server.utils.torch_utils import is_bf16_supported
 
 # The flag below controls whether to allow TF32 on matmul. This flag defaults to False
 # in PyTorch 1.12 and later.
@@ -43,40 +40,6 @@ __all__ = [
     "get_model",
 ]
 
-FLASH_ATT_ERROR_MESSAGE = "{} requires Flash Attention enabled models."
-
-FLASH_ATTENTION = True
-try:
-    from lorax_server.models.flash_rw import FlashRWSharded
-    from lorax_server.models.flash_neox import FlashNeoXSharded
-    from lorax_server.models.flash_llama import FlashLlama
-    from lorax_server.models.flash_gpt2 import FlashGPT2
-    from lorax_server.models.flash_qwen import FlashQwen
-    from lorax_server.models.flash_santacoder import (
-        FlashSantacoderSharded,
-    )
-
-except ImportError as e:
-    logger.warning(f"Could not import Flash Attention enabled models: {e}")
-    FLASH_ATTENTION = False
-
-if FLASH_ATTENTION:
-    __all__.append(FlashNeoXSharded)
-    __all__.append(FlashRWSharded)
-    __all__.append(FlashSantacoderSharded)
-    __all__.append(FlashLlama)
-    __all__.append(FlashQwen)
-    
-MISTRAL = True
-try:
-    from lorax_server.models.flash_mistral import FlashMistral
-except ImportError as e:
-    logger.warning(f"Could not import Mistral model: {e}")
-    MISTRAL = False
-
-if MISTRAL:
-    __all__.append(FlashMistral)
-
 
 def get_model(
     model_id: str,
@@ -84,230 +47,325 @@ def get_model(
     revision: Optional[str],
     sharded: bool,
     quantize: Optional[str],
+    compile: bool,
     dtype: Optional[str],
     trust_remote_code: bool,
     source: str,
     adapter_source: str,
+    merge_adapter_weights: bool,
+    embedding_dim: Optional[int] = None,
 ) -> Model:
     config_dict = None
     if source == "s3":
         # change the model id to be the local path to the folder so
         # we can load the config_dict locally
-        logger.info(f"Using the local files since we are coming from s3")
+        logger.info("Using the local files since we are coming from s3")
         model_path = get_s3_model_local_dir(model_id)
         logger.info(f"model_path: {model_path}")
         config_dict, _ = PretrainedConfig.get_config_dict(
             model_path, revision=revision, trust_remote_code=trust_remote_code
         )
         logger.info(f"config_dict: {config_dict}")
-        model_id = model_path
+        model_id = str(model_path)
     elif source == "hub":
         config_dict, _ = PretrainedConfig.get_config_dict(
             model_id, revision=revision, trust_remote_code=trust_remote_code
         )
-    else: 
+    else:
         raise ValueError(f"Unknown source {source}")
-    
-    model_type = config_dict["model_type"]
 
-    if dtype is None:
-        dtype = torch.float16
-    elif dtype == "float16":
+    model_type = config_dict["model_type"]
+    is_dtype_provided = dtype is not None
+    dtype = dtype or config_dict.get("torch_dtype", "float16")
+
+    if dtype in {"float16", "float32"}:
         dtype = torch.float16
     elif dtype == "bfloat16":
-        dtype = torch.bfloat16
+        if not is_bf16_supported():
+            if is_dtype_provided:
+                raise RuntimeError("bfloat16 is not supported on this device, set --dtype float16.")
+            logger.warning("bfloat16 is not supported on this device, falling back to float16")
+            dtype = torch.float16
+        else:
+            dtype = torch.bfloat16
     else:
-        raise RuntimeError(f"Unknown dtype {dtype}")
+        try:
+            dtype = getattr(torch, dtype)
+        except AttributeError:
+            raise RuntimeError(f"Unknown dtype {dtype}")
 
     if "facebook/galactica" in model_id:
         return GalacticaSharded(
             model_id,
             revision,
             quantize=quantize,
+            compile=compile,
             dtype=dtype,
             dtypetrust_remote_code=trust_remote_code,
         )
 
-    if model_id.startswith("bigcode/"):
-        if FLASH_ATTENTION:
-            return FlashSantacoderSharded(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        elif sharded:
-            raise NotImplementedError(
-                FLASH_ATT_ERROR_MESSAGE.format("Sharded Santacoder")
-            )
-        else:
-            return SantaCoder(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
+    if model_type == "bert":
+        from lorax_server.models.flash_bert import FlashBert
 
-    if model_type == "gpt_bigcode":
-        if FLASH_ATTENTION:
-            return FlashSantacoderSharded(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        elif sharded:
-            raise NotImplementedError(
-                FLASH_ATT_ERROR_MESSAGE.format("Sharded Santacoder")
-            )
-        else:
-            return SantaCoder(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
+        if config_dict["architectures"][0] == "BertForTokenClassification":
+            return FlashBert(model_id, revision=revision, dtype=dtype, classifcation_head=True)
+        return FlashBert(model_id, revision=revision, dtype=dtype)
+
+    if model_type == "distilbert":
+        from lorax_server.models.flash_distilbert import FlashDistilBert
+
+        if config_dict["architectures"][0] == "DistilBertForMaskedLM":
+            return FlashDistilBert(model_id, revision=revision, dtype=dtype)
+
+        if config_dict["architectures"][0] == "DistilBertForTokenClassification":
+            return FlashDistilBert(model_id, revision=revision, dtype=dtype, classifcation_head=True)
+
+    if model_type == "xlm-roberta":
+        from lorax_server.models.flash_roberta import FlashXlmRoberta
+
+        return FlashXlmRoberta(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision=revision,
+            dtype=dtype,
+            merge_adapter_weights=merge_adapter_weights,
+        )
+
+    flash_causal_lm_kwargs = dict(
+        quantize=quantize,
+        compile=compile,
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+        merge_adapter_weights=merge_adapter_weights,
+    )
+
+    if model_id.startswith("bigcode/") or model_type == "gpt_bigcode":
+        from lorax_server.models.flash_santacoder import FlashSantacoderSharded
+
+        return FlashSantacoderSharded(
+            model_id,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
 
     if model_type == "bloom":
         return BLOOMSharded(
             model_id,
             revision,
             quantize=quantize,
+            compile=compile,
             dtype=dtype,
             trust_remote_code=trust_remote_code,
         )
+
     if model_type == "mpt":
         return MPTSharded(
-            model_id, revision, quantize=quantize, trust_remote_code=trust_remote_code
+            model_id,
+            revision,
+            quantize=quantize,
+            compile=compile,
+            trust_remote_code=trust_remote_code,
         )
 
     if model_type == "gpt_neox":
-        if FLASH_ATTENTION:
-            return FlashNeoXSharded(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        elif sharded:
-            return GPTNeoxSharded(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        else:
-            return CausalLM(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
+        from lorax_server.models.flash_neox import FlashNeoXSharded
+
+        return FlashNeoXSharded(
+            model_id,
+            revision,
+            quantize=quantize,
+            compile=compile,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
 
     if model_type == "llama":
-        if FLASH_ATTENTION:
-            return FlashLlama(
-                model_id,
-                adapter_id,
-                adapter_source,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        elif sharded:
-            raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format("Sharded Llama"))
-        else:
-            return CausalLM(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
+        from lorax_server.models.flash_llama import FlashLlama
+
+        return FlashLlama(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
 
     if model_type == "gpt2":
-        if FLASH_ATTENTION:
-            return FlashGPT2(
-                model_id,
-                adapter_id,
-                adapter_source,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format("GPT-2"))
+        from lorax_server.models.flash_gpt2 import FlashGPT2
+
+        return FlashGPT2(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
 
     if model_type in ["RefinedWeb", "RefinedWebModel", "falcon"]:
-        if sharded:
-            if FLASH_ATTENTION:
-                if config_dict.get("alibi", False):
-                    raise NotImplementedError("sharded is not supported for this model")
-                return FlashRWSharded(
-                    model_id,
-                    revision,
-                    quantize=quantize,
-                    dtype=dtype,
-                    trust_remote_code=trust_remote_code,
-                )
-            raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Falcon"))
-        else:
-            if FLASH_ATTENTION and not config_dict.get("alibi", False):
-                return FlashRWSharded(
-                    model_id,
-                    revision,
-                    quantize=quantize,
-                    dtype=dtype,
-                    trust_remote_code=trust_remote_code,
-                )
-            else:
-                return RW(
-                    model_id,
-                    revision,
-                    quantize=quantize,
-                    dtype=dtype,
-                    trust_remote_code=trust_remote_code,
-                )
+        from lorax_server.models.flash_rw import FlashRWSharded
+
+        return FlashRWSharded(
+            model_id,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
 
     if model_type == "mistral":
-        if MISTRAL:
-            return FlashMistral(
-                model_id,
-                adapter_id,
-                adapter_source,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        raise NotImplementedError("Mistral model requires flash attention v2")
-    
+        from lorax_server.models.flash_mistral import FlashMistral
+
+        return FlashMistral(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "mixtral":
+        from lorax_server.models.flash_mixtral import FlashMixtral
+
+        return FlashMixtral(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
     if model_type == "qwen":
-        if FLASH_ATTENTION:
-            return FlashQwen(
-                model_id,
-                adapter_id,
-                adapter_source,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        raise NotImplementedError("Qwen model requires flash attention v2")
+        from lorax_server.models.flash_qwen import FlashQwen
+
+        return FlashQwen(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "qwen2":
+        from lorax_server.models.flash_qwen2 import FlashQwen2
+
+        return FlashQwen2(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            embedding_dim=embedding_dim,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type in ["phi-msft", "phi"]:
+        from lorax_server.models.flash_phi import FlashPhi
+
+        return FlashPhi(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "phi3":
+        from lorax_server.models.flash_phi3 import FlashPhi3
+
+        return FlashPhi3(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "solar":
+        from lorax_server.models.flash_solar import FlashSolar
+
+        return FlashSolar(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "gemma":
+        from lorax_server.models.flash_gemma import FlashGemma
+
+        return FlashGemma(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "gemma2":
+        from lorax_server.models.flash_gemma2 import FlashGemma2
+
+        return FlashGemma2(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "cohere":
+        from lorax_server.models.flash_cohere import FlashCohere
+
+        return FlashCohere(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "dbrx":
+        from lorax_server.models.flash_dbrx import FlashDbrx
+
+        return FlashDbrx(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "llava_next" or model_type == "llava":
+        from lorax_server.models.custom_modeling.llava_next import LlavaNextForConditionalGeneration
+        from lorax_server.models.vlm_causal_lm import VlmCausalLM
+
+        return VlmCausalLM(
+            model_class=LlavaNextForConditionalGeneration,
+            model_id=model_id,
+            adapter_id=adapter_id,
+            adapter_source=adapter_source,
+            revision=revision,
+            **flash_causal_lm_kwargs,
+        )
+
+    if model_type == "mllama":
+        from lorax_server.models.custom_modeling.mllama import MllamaForConditionalGeneration
+        from lorax_server.models.mllama import MllamaCausalLM, MllamaCausalLMBatch
+
+        return MllamaCausalLM(
+            model_id=model_id,
+            model_class=MllamaForConditionalGeneration,
+            batch_class=MllamaCausalLMBatch,
+            adapter_id=adapter_id,
+            adapter_source=adapter_source,
+            revision=revision,
+            **flash_causal_lm_kwargs,
+        )
 
     if model_type == "opt":
         return OPTSharded(
             model_id,
             revision,
             quantize=quantize,
+            compile=compile,
             dtype=dtype,
             trust_remote_code=trust_remote_code,
         )
@@ -317,59 +375,20 @@ def get_model(
             model_id,
             revision,
             quantize=quantize,
+            compile=compile,
             dtype=dtype,
             trust_remote_code=trust_remote_code,
         )
 
-    if sharded:
-        raise ValueError("sharded is not supported for AutoModel")
-    if quantize == "gptq":
-        raise ValueError(
-            "gptq quantization is not supported for AutoModel, you can try to quantize it with `lorax-server quantize ORIGINAL_MODEL_ID NEW_MODEL_ID`"
-        )
-    elif (quantize == "bitsandbytes-fp4") or (quantize == "bitsandbytes-nf4"):
-        raise ValueError(
-            "4bit quantization is not supported for AutoModel"
-        )
-    if quantize == "awq":
-        raise ValueError(
-            "awq quantization is not supported for AutoModel"
-        )
+    if model_type == "granite":
+        from lorax_server.models.flash_granite import FlashGranite
 
-    if model_type in modeling_auto.MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-        return CausalLM(
+        return FlashGranite(
             model_id,
+            adapter_id,
+            adapter_source,
             revision,
-            quantize=quantize,
-            dtype=dtype,
-            trust_remote_code=trust_remote_code,
+            **flash_causal_lm_kwargs,
         )
-    if model_type in modeling_auto.MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES:
-        return Seq2SeqLM(
-            model_id,
-            revision,
-            quantize=quantize,
-            dtype=dtype,
-            trust_remote_code=trust_remote_code,
-        )
-
-    auto_map = config_dict.get("auto_map", None)
-    if trust_remote_code and auto_map is not None:
-        if "AutoModelForCausalLM" in auto_map.keys():
-            return CausalLM(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
-        if "AutoModelForSeq2SeqLM" in auto_map.keys():
-            return Seq2SeqLM(
-                model_id,
-                revision,
-                quantize=quantize,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-            )
 
     raise ValueError(f"Unsupported model type {model_type}")

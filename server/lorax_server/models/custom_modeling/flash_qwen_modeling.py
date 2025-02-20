@@ -4,30 +4,32 @@
 # Copyright (c) Alibaba Cloud.
 # LICENSE: https://huggingface.co/Qwen/Qwen-7B/blob/main/LICENSE
 
-import torch
-import torch.distributed
-
-from torch import nn
-from transformers.activations import ACT2FN
-from transformers.configuration_utils import PretrainedConfig
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 # Flash attention imports
 import dropout_layer_norm
+import torch
+import torch.distributed
+from torch import nn
+from transformers.activations import ACT2FN
+from transformers.configuration_utils import PretrainedConfig
 
-from lorax_server.utils import flash_attn
-from lorax_server.utils import paged_attn
+from lorax_server.adapters import AdapterBatchData
+from lorax_server.models.custom_modeling.utils import prepend
+from lorax_server.utils import flash_attn, paged_attention
+from lorax_server.utils.attention.common import Seqlen
 from lorax_server.utils.layers import (
+    MultiAdapterHead,
+    PositionRotaryEmbedding,
     TensorParallelAdapterRowLinear,
-    TensorParallelRowLinear,
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
-    TensorParallelMultiAdapterLinear,
-    PositionRotaryEmbedding,
     TensorParallelHead,
+    TensorParallelMultiAdapterLinear,
+    TensorParallelRowLinear,
 )
-from lorax_server.utils.lora import LM_HEAD, AdapterBatchData
-
+from lorax_server.utils.lora import LM_HEAD
+from lorax_server.utils.torch_utils import is_fp8_kv
 
 ATTN_C_ATTN = "attn.c_attn"
 ATTN_C_PROJ = "attn.c_proj"
@@ -107,9 +109,7 @@ class QwenRMSNorm(nn.Module):
 
             hidden_states = hidden_states.to(torch.float32)
             variance = hidden_states.pow(2).mean(-1, keepdim=True)
-            hidden_states = hidden_states * torch.rsqrt(
-                variance + self.variance_epsilon
-            )
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 
             # convert into half-precision if necessary
             if self.weight.dtype in [torch.float16, torch.bfloat16]:
@@ -139,22 +139,30 @@ class QwenRMSNorm(nn.Module):
                 res = hidden_states
 
             return normed_hidden_states, res
-        
+
 
 def load_attention(config, prefix, weights, layer_id):
-    base_layer = load_attention_multi(config, prefix, weights)
-    projection_size = config.kv_channels * config.num_attention_heads
+    projection_size = (config.hidden_size // config.num_attention_heads) * config.num_attention_heads
+    base_layer = load_attention_multi(config, prefix, weights, projection_size)
     return TensorParallelMultiAdapterLinear.load(
-        base_layer, layer_id, [ATTN_C_ATTN], sizes=[
+        base_layer,
+        layer_id,
+        [ATTN_C_ATTN],
+        sizes=[
             3 * projection_size,
-        ], process_group=weights.process_group
+        ],
+        process_group=weights.process_group,
     )
 
 
-def load_attention_multi(config, prefix, weights):
+def load_attention_multi(config, prefix, weights, projection_size):
     return TensorParallelColumnLinear.load_multi(
         config,
-        prefixes=[f"{prefix}.c_attn"],
+        prefixes=[
+            (f"{prefix}.c_attn", (0, projection_size)),
+            (f"{prefix}.c_attn", (projection_size, projection_size)),
+            (f"{prefix}.c_attn", (2 * projection_size, projection_size)),
+        ],
         dim=0,
         weights=weights,
         bias=True,
@@ -173,13 +181,15 @@ class FlashQwenAttention(torch.nn.Module):
         self.num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.num_heads
-        self.projection_size = config.kv_channels * config.num_attention_heads
+        self.projection_size = (self.head_size * config.num_attention_heads) // weights.process_group.size()
+        self.process_group = weights.process_group
 
         self.rotary_emb = PositionRotaryEmbedding.static(
             config=config,
             dim=self.head_size,
             base=config.rope_theta,
             device=weights.device,
+            dtype=weights.dtype,
         )
 
         self.softmax_scale = self.head_size**-0.5
@@ -191,15 +201,28 @@ class FlashQwenAttention(torch.nn.Module):
             )
         self.num_heads = self.num_heads // weights.process_group.size()
         self.num_key_value_heads = self.num_heads
+        if is_fp8_kv(config.quantize):
+            self.k_scale = weights.get_tensor(f"{prefix}.k_scale", use_self_dtype=False).item()
+            self.v_scale = weights.get_tensor(f"{prefix}.v_scale", use_self_dtype=False).item()
+            self.fp8_kv = True
+        else:
+            self.k_scale = 1.0
+            self.v_scale = 1.0
+            self.fp8_kv = False
 
         self.c_attn = load_attention(config, prefix, weights, layer_id)
 
-        self.c_proj = TensorParallelAdapterRowLinear.load(TensorParallelRowLinear.load(
-            config,
-            prefix=f"{prefix}.c_proj",
-            weights=weights,
-            bias=False,
-        ), layer_id, ATTN_C_PROJ, process_group=weights.process_group)
+        self.c_proj = TensorParallelAdapterRowLinear.load(
+            TensorParallelRowLinear.load(
+                config,
+                prefix=f"{prefix}.c_proj",
+                weights=weights,
+                bias=False,
+            ),
+            layer_id,
+            ATTN_C_PROJ,
+            process_group=weights.process_group,
+        )
         self.num_groups = self.num_heads // self.num_key_value_heads
         self.kv_head_mapping = torch.arange(
             0, self.num_key_value_heads, dtype=torch.int32, device=weights.device
@@ -214,7 +237,7 @@ class FlashQwenAttention(torch.nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
         adapter_data,
     ):
@@ -232,38 +255,48 @@ class FlashQwenAttention(torch.nn.Module):
         self.rotary_emb(query, cos, sin)
         self.rotary_emb(torch.select(kv, dim=1, index=0), cos, sin)
 
-        paged_attn.reshape_and_cache(
-            kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots
+        paged_attention.reshape_and_cache(
+            kv[:, 0],
+            kv[:, 1],
+            kv_cache[0],
+            kv_cache[1],
+            slots,
+            self.k_scale,
+            self.v_scale,
+            self.fp8_kv,
         )
-
-        # output tensor
-        attn_output = torch.empty_like(query)
 
         # Prefill
         if cu_seqlen_prefill is not None:
             # flash attention
-            flash_attn.attention(
+            attn_output = flash_attn.attention(
                 query,
                 torch.select(kv, dim=1, index=0),
                 torch.select(kv, dim=1, index=1),
-                attn_output,
+                kv_cache[0],
+                kv_cache[1],
                 cu_seqlen_prefill,
                 max_s,
                 self.softmax_scale,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
+                fp8_kv=self.fp8_kv,
             )
         # Decode
         else:
             # kv_cache[1] => [num_blocks, num_heads, head_size, block_size]
-            paged_attn.single_query_cached_kv_attention(
-                attn_output,
+            attn_output = paged_attention.attention(
                 query,
                 kv_cache[0],
                 kv_cache[1],
+                self.num_key_value_heads,
                 self.kv_head_mapping,
                 self.softmax_scale,
                 block_tables,
-                input_lengths,
+                seqlen,
                 max_s,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
             )
 
         return self.c_proj(attn_output.view(-1, self.num_heads * self.head_size), adapter_data)
@@ -278,9 +311,7 @@ class QwenMLP(nn.Module):
             if "gelu" not in act
             else lambda x: torch.nn.functional.gelu(
                 x,
-                approximate="tanh"
-                if act in ["gelu_fast", "gelu_pytorch_tanh"]
-                else "none",
+                approximate="tanh" if act in ["gelu_fast", "gelu_pytorch_tanh"] else "none",
             )
         )
         # Fuse gate and up proj
@@ -292,21 +323,28 @@ class QwenMLP(nn.Module):
             bias=False,
         )
         self.gate_up_proj = TensorParallelMultiAdapterLinear.load(
-            gate_up_proj, layer_id, [MLP_W2, MLP_W1], sizes=[
+            gate_up_proj,
+            layer_id,
+            [MLP_W2, MLP_W1],
+            sizes=[
                 config.intermediate_size // 2,
                 config.intermediate_size // 2,
-            ], process_group=weights.process_group
+            ],
+            process_group=weights.process_group,
         )
 
-        self.c_proj = TensorParallelAdapterRowLinear.load(TensorParallelRowLinear.load(
-            config,
-            prefix=f"{prefix}.c_proj",
-            weights=weights,
-            bias=False,
-        ), layer_id, MLP_C_PROJ, process_group=weights.process_group)
-        self.intermediate_size = (
-            config.intermediate_size // weights.process_group.size()
+        self.c_proj = TensorParallelAdapterRowLinear.load(
+            TensorParallelRowLinear.load(
+                config,
+                prefix=f"{prefix}.c_proj",
+                weights=weights,
+                bias=False,
+            ),
+            layer_id,
+            MLP_C_PROJ,
+            process_group=weights.process_group,
         )
+        self.intermediate_size = config.intermediate_size // weights.process_group.size()
 
     def forward(self, hidden_states, adapter_data):
         gate_up_states = self.gate_up_proj(hidden_states, adapter_data)
@@ -315,17 +353,18 @@ class QwenMLP(nn.Module):
 
 
 class FlashQwenLayer(nn.Module):
-    def __init__(self, layer_id, config, weights):
+    def __init__(self, prefix: str, layer_id, config, weights):
         super().__init__()
-        prefix = f"transformer.h.{layer_id}"
+        prefix = prepend(prefix, f"transformer.h.{layer_id}")
         self.attn = FlashQwenAttention(
-            prefix=f"{prefix}.attn", config=config, weights=weights, layer_id=layer_id,
+            prefix=f"{prefix}.attn",
+            config=config,
+            weights=weights,
+            layer_id=layer_id,
         )
         self.mlp = QwenMLP(prefix=f"{prefix}.mlp", config=config, weights=weights, layer_id=layer_id)
 
-        self.ln_1 = QwenRMSNorm(
-            prefix=f"{prefix}.ln_1", weights=weights, eps=config.layer_norm_epsilon
-        )
+        self.ln_1 = QwenRMSNorm(prefix=f"{prefix}.ln_1", weights=weights, eps=config.layer_norm_epsilon)
         self.ln_2 = QwenRMSNorm(
             prefix=f"{prefix}.ln_2",
             weights=weights,
@@ -342,7 +381,7 @@ class FlashQwenLayer(nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
         adapter_data,
     ):
@@ -357,15 +396,13 @@ class FlashQwenLayer(nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
             adapter_data,
         )
 
         # faster post attention rms norm
-        normed_attn_res_output, attn_res = self.ln_2(
-            attn_output, res
-        )
+        normed_attn_res_output, attn_res = self.ln_2(attn_output, res)
 
         mlp_output = self.mlp(normed_attn_res_output, adapter_data)
 
@@ -373,18 +410,17 @@ class FlashQwenLayer(nn.Module):
 
 
 class FlashQwenModel(torch.nn.Module):
-    def __init__(self, config, weights):
+    def __init__(self, prefix: str, config, weights):
         super().__init__()
 
         process_group = weights.process_group
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
-        self.wte = TensorParallelEmbedding(
-            prefix="transformer.wte", weights=weights
-        )
+        self.wte = TensorParallelEmbedding(prefix=prepend(prefix, "transformer.wte"), weights=weights)
         self.h = nn.ModuleList(
             [
                 FlashQwenLayer(
+                    prefix,
                     layer_id,
                     config,
                     weights,
@@ -393,7 +429,7 @@ class FlashQwenModel(torch.nn.Module):
             ]
         )
         self.ln_f = QwenRMSNorm(
-            prefix="transformer.ln_f", weights=weights, eps=config.layer_norm_epsilon
+            prefix=prepend(prefix, "transformer.ln_f"), weights=weights, eps=config.layer_norm_epsilon
         )
 
         self.gradient_checkpointing = False
@@ -410,7 +446,7 @@ class FlashQwenModel(torch.nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
         adapter_data: AdapterBatchData,
     ) -> torch.Tensor:
@@ -418,9 +454,7 @@ class FlashQwenModel(torch.nn.Module):
 
         # Get rotary cos and sin for this forward
         # Avoid to index in each layer
-        cos, sin = self.h[0].attn.rotary_emb.get_cos_sin(
-            position_ids, max_s, hidden_states.dtype
-        )
+        cos, sin = self.h[0].attn.rotary_emb.get_cos_sin(position_ids, max_s, hidden_states.dtype)
 
         residual = None
         for i, layer in enumerate(self.h):
@@ -433,7 +467,7 @@ class FlashQwenModel(torch.nn.Module):
                 kv_cache[i],
                 block_tables,
                 slots,
-                input_lengths,
+                seqlen,
                 max_s,
                 adapter_data,
             )
@@ -444,15 +478,21 @@ class FlashQwenModel(torch.nn.Module):
 
 
 class FlashQwenForCausalLM(torch.nn.Module):
-    def __init__(self, config, weights):
+    def __init__(self, prefix: str, config, weights):
         super().__init__()
+        self.config = config
 
-        self.transformer = FlashQwenModel(config, weights)
-        self.lm_head = TensorParallelAdapterRowLinear.load(TensorParallelHead.load(
-            config,
-            prefix="lm_head",
-            weights=weights,
-        ), 0, LM_HEAD, process_group=weights.process_group)
+        self.transformer = FlashQwenModel(prefix, config, weights)
+        self.lm_head = MultiAdapterHead.load(
+            TensorParallelHead.load(
+                config,
+                prefix=prepend(prefix, "lm_head"),
+                weights=weights,
+            ),
+            0,
+            LM_HEAD,
+            process_group=weights.process_group,
+        )
 
     def forward(
         self,
@@ -462,11 +502,13 @@ class FlashQwenForCausalLM(torch.nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
         adapter_data: AdapterBatchData,
+        prefill_cache_indices: Optional[torch.Tensor] = None,
         lm_head_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        skip_lm_head: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         hidden_states = self.transformer(
             input_ids,
             position_ids,
@@ -474,11 +516,15 @@ class FlashQwenForCausalLM(torch.nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
             adapter_data,
         )
         if lm_head_indices is not None:
             hidden_states = hidden_states[lm_head_indices]
-        logits = self.lm_head(hidden_states, adapter_data)
-        return logits
+
+        if skip_lm_head:
+            return hidden_states, None
+
+        logits, speculative_logits = self.lm_head(hidden_states, adapter_data)
+        return logits, speculative_logits

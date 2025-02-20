@@ -1,43 +1,36 @@
+from typing import List, Optional, Tuple
+
 import torch
 import torch.distributed
-
 from torch import nn
 from transformers.activations import ACT2FN
-from typing import Optional, List, Tuple
 
-from lorax_server.utils import flash_attn
-from lorax_server.utils import paged_attn
+from lorax_server.models.custom_modeling.utils import prepend
+from lorax_server.utils import flash_attn, paged_attention
+from lorax_server.utils.attention.common import Seqlen
 from lorax_server.utils.layers import (
-    TensorParallelRowLinear,
-    TensorParallelColumnLinear,
-    TensorParallelHead,
-    TensorParallelEmbedding,
     FastLayerNorm,
+    TensorParallelColumnLinear,
+    TensorParallelEmbedding,
+    TensorParallelHead,
+    TensorParallelRowLinear,
     get_linear,
 )
 
 
-def load_multi_mqa(
-    config, prefix: str, weights, bias: bool, head_size, num_heads, hidden_size
-):
-    if config.quantize == "gptq":
-        return _load_multi_mqa_gptq(
-            config, prefix, weights, bias, head_size, num_heads, hidden_size
-        )
+def load_multi_mqa(config, prefix: str, weights, bias: bool, head_size, num_heads, hidden_size):
+    if config.quantize in ["gptq", "awq", "eetq"]:
+        return _load_multi_mqa_gptq(config, prefix, weights, bias, head_size, num_heads, hidden_size)
     else:
-        return _load_multi_mqa(
-            config, prefix, weights, bias, head_size, num_heads, hidden_size
-        )
+        return _load_multi_mqa(config, prefix, weights, bias, head_size, num_heads, hidden_size)
 
 
-def _load_multi_mqa_gptq(
-    config, prefix: str, weights, bias: bool, head_size, num_heads, hidden_size
-):
+def _load_multi_mqa_gptq(config, prefix: str, weights, bias: bool, head_size, num_heads, hidden_size):
     if any("c_attn" in k for k in weights.routing.keys()) and not config.transpose:
         world_size = weights.process_group.size()
         rank = weights.process_group.rank()
 
-        slice_ = weights._get_slice(f"{prefix}.c_attn.qweight")
+        slice_ = weights.get_slice(f"{prefix}.c_attn.qweight")
         shape = slice_.get_shape()
         block_size = (shape[1] - 2 * head_size) // world_size
         start = rank * block_size
@@ -48,7 +41,7 @@ def _load_multi_mqa_gptq(
         qweight = torch.cat([q_tensor, kv_tensor], dim=1)
         qweight = qweight.to(device=weights.device)
 
-        slice_ = weights._get_slice(f"{prefix}.c_attn.scales")
+        slice_ = weights.get_slice(f"{prefix}.c_attn.scales")
         shape = slice_.get_shape()
         block_size = (shape[1] - 2 * head_size) // world_size
         start = rank * block_size
@@ -59,7 +52,7 @@ def _load_multi_mqa_gptq(
         scales = torch.cat([q_tensor, kv_tensor], dim=1)
         scales = scales.to(device=weights.device)
 
-        slice_ = weights._get_slice(f"{prefix}.c_attn.qzeros")
+        slice_ = weights.get_slice(f"{prefix}.c_attn.qzeros")
         shape = slice_.get_shape()
         block_size = (shape[1] - (2 * head_size) * 4 // 32) // world_size
         start = rank * block_size
@@ -72,7 +65,7 @@ def _load_multi_mqa_gptq(
 
         g_idx = weights.get_tensor(f"{prefix}.c_attn.g_idx")
         g_idx = g_idx.to(device=weights.device)
-        bits, groupsize = weights._get_gptq_params()
+        bits, groupsize = weights._get_bits_and_groupsize()
 
         from lorax_server.utils.layers import HAS_EXLLAMA
 
@@ -80,7 +73,7 @@ def _load_multi_mqa_gptq(
         weight = (qweight, qzeros, scales, g_idx, bits, groupsize, use_exllama)
 
         if bias:
-            slice_ = weights._get_slice(f"{prefix}.c_attn.bias")
+            slice_ = weights.get_slice(f"{prefix}.c_attn.bias")
             shape = slice_.get_shape()
             block_size = (shape[0] - 2 * head_size) // world_size
             assert (shape[0] - 2 * head_size) % world_size == 0
@@ -97,11 +90,9 @@ def _load_multi_mqa_gptq(
         raise NotImplementedError("Gptq loading with santacoder is not implemented")
 
 
-def _load_multi_mqa(
-    config, prefix: str, weights, bias: bool, head_size, num_heads, hidden_size
-):
+def _load_multi_mqa(config, prefix: str, weights, bias: bool, head_size, num_heads, hidden_size):
     if any("c_attn" in k for k in weights.routing.keys()):
-        slice_ = weights._get_slice(f"{prefix}.c_attn.weight")
+        slice_ = weights.get_slice(f"{prefix}.c_attn.weight")
         shape = slice_.get_shape()
         world_size = weights.process_group.size()
         rank = weights.process_group.rank()
@@ -122,7 +113,7 @@ def _load_multi_mqa(
             kv_tensor = slice_[-2 * head_size :]
             weight = torch.cat([q_tensor, kv_tensor], dim=0)
         if bias:
-            slice_ = weights._get_slice(f"{prefix}.c_attn.bias")
+            slice_ = weights.get_slice(f"{prefix}.c_attn.bias")
             shape = slice_.get_shape()
             block_size = (shape[0] - 2 * head_size) // world_size
             assert (shape[0] - 2 * head_size) % world_size == 0
@@ -161,9 +152,7 @@ def _load_multi_mqa(
     ], f"{weight.shape} != {[(num_heads + 2) * head_size, hidden_size]}"
     if bias is not None:
         bias = bias.to(dtype=weights.dtype).to(device=weights.device)
-        assert list(bias.shape) == [
-            (num_heads + 2) * head_size
-        ], f"{weight.shape} != {[(num_heads + 2) * head_size]}"
+        assert list(bias.shape) == [(num_heads + 2) * head_size], f"{weight.shape} != {[(num_heads + 2) * head_size]}"
     return TensorParallelColumnLinear(get_linear(weight, bias, config.quantize))
 
 
@@ -171,9 +160,7 @@ def load_col(config, prefix: str, weights, bias: bool):
     if config.transpose:
         weight = weights.get_sharded(f"{prefix}.weight", dim=1).T
     else:
-        weight = weights.get_multi_weights_col(
-            [prefix], quantize=config.quantize, dim=0
-        )
+        weight = weights.get_multi_weights_col([prefix], quantize=config.quantize, dim=0)
 
     if bias:
         bias = weights.get_sharded(f"{prefix}.bias", dim=0)
@@ -193,9 +180,7 @@ def load_row(config, prefix: str, weights, bias: bool):
         bias = weights.get_tensor(f"{prefix}.bias")
     else:
         bias = None
-    return TensorParallelRowLinear(
-        get_linear(weight, bias, config.quantize), process_group=weights.process_group
-    )
+    return TensorParallelRowLinear(get_linear(weight, bias, config.quantize), process_group=weights.process_group)
 
 
 class FlashMQAttention(torch.nn.Module):
@@ -226,12 +211,8 @@ class FlashMQAttention(torch.nn.Module):
             hidden_size=hidden_size,
             num_heads=self.num_heads,
         )
-        self.c_proj = load_row(
-            config, prefix=f"{prefix}.c_proj", weights=weights, bias=True
-        )
-        self.kv_head_mapping = torch.zeros(
-            self.num_heads, dtype=torch.int32, device=weights.device
-        )
+        self.c_proj = load_row(config, prefix=f"{prefix}.c_proj", weights=weights, bias=True)
+        self.kv_head_mapping = torch.zeros(self.num_heads, dtype=torch.int32, device=weights.device)
 
     def forward(
         self,
@@ -240,35 +221,29 @@ class FlashMQAttention(torch.nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
     ):
         qkv = self.c_attn(hidden_states)
 
         # Split query from key_value
-        query, key_value = qkv.split(
-            [self.head_size * self.num_heads, 2 * self.head_size], dim=1
-        )
+        query, key_value = qkv.split([self.head_size * self.num_heads, 2 * self.head_size], dim=1)
 
         # Prepare query and key_value for indexing
         query = query.view(-1, self.num_heads, self.head_size)
         key_value = key_value.view(-1, 2, 1, self.head_size)
 
-        paged_attn.reshape_and_cache(
-            key_value[:, 0], key_value[:, 1], kv_cache[0], kv_cache[1], slots
-        )
-
-        # output
-        attn_output = torch.empty_like(query)
+        paged_attention.reshape_and_cache(key_value[:, 0], key_value[:, 1], kv_cache[0], kv_cache[1], slots)
 
         # Prefill
         if cu_seqlen_prefill is not None:
             # flash attention
-            flash_attn.attention(
+            attn_output = flash_attn.attention(
                 query,
                 torch.select(key_value, dim=1, index=0),
                 torch.select(key_value, dim=1, index=1),
-                attn_output,
+                kv_cache[0],
+                kv_cache[1],
                 cu_seqlen_prefill,
                 max_s,
                 self.softmax_scale,
@@ -276,15 +251,15 @@ class FlashMQAttention(torch.nn.Module):
         # Decode
         else:
             # kv_cache[1] => [num_blocks, 1, head_size, block_size]
-            paged_attn.single_query_cached_kv_attention(
-                attn_output,
+            attn_output = paged_attention.attention(
                 query,
                 kv_cache[0],
                 kv_cache[1],
+                self.num_heads,
                 self.kv_head_mapping,
                 self.softmax_scale,
                 block_tables,
-                input_lengths,
+                seqlen,
                 max_s,
             )
 
@@ -300,18 +275,12 @@ class MLP(nn.Module):
             if "gelu" not in act
             else lambda x: torch.nn.functional.gelu(
                 x,
-                approximate="tanh"
-                if act in ["gelu_fast", "gelu_pytorch_tanh"]
-                else "none",
+                approximate="tanh" if act in ["gelu_fast", "gelu_pytorch_tanh"] else "none",
             )
         )
 
-        self.c_fc = load_col(
-            config, prefix=f"{prefix}.c_fc", weights=weights, bias=True
-        )
-        self.c_proj = load_row(
-            config, prefix=f"{prefix}.c_proj", weights=weights, bias=True
-        )
+        self.c_fc = load_col(config, prefix=f"{prefix}.c_fc", weights=weights, bias=True)
+        self.c_proj = load_row(config, prefix=f"{prefix}.c_proj", weights=weights, bias=True)
 
     def forward(self, hidden_states):
         hidden_states = self.c_fc(hidden_states)
@@ -321,15 +290,11 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, layer_id, config, weights):
+    def __init__(self, prefix: str, layer_id, config, weights):
         super().__init__()
-        prefix = f"transformer.h.{layer_id}"
-        self.ln_1 = FastLayerNorm.load(
-            prefix=f"{prefix}.ln_1", weights=weights, eps=config.layer_norm_epsilon
-        )
-        self.ln_2 = FastLayerNorm.load(
-            prefix=f"{prefix}.ln_2", weights=weights, eps=config.layer_norm_epsilon
-        )
+        prefix = prepend(prefix, f"transformer.h.{layer_id}")
+        self.ln_1 = FastLayerNorm.load(prefix=f"{prefix}.ln_1", weights=weights, eps=config.layer_norm_epsilon)
+        self.ln_2 = FastLayerNorm.load(prefix=f"{prefix}.ln_2", weights=weights, eps=config.layer_norm_epsilon)
         self.attn = FlashMQAttention(
             prefix=f"{prefix}.attn",
             config=config,
@@ -349,7 +314,7 @@ class Block(nn.Module):
         kv_cache,
         block_tables,
         slots,
-        input_lengths,
+        seqlen,
         max_s,
     ):
         hidden_states, residual = self.ln_1(hidden_states, residual)
@@ -359,7 +324,7 @@ class Block(nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
         )
 
@@ -371,18 +336,18 @@ class Block(nn.Module):
 
 
 class FlashSantacoderModel(nn.Module):
-    def __init__(self, config, weights):
+    def __init__(self, prefix: str, config, weights):
         super().__init__()
         self.config = config
 
         self.process_group = weights.process_group
         self.wte = TensorParallelEmbedding(
-            prefix="transformer.wte",
+            prefix=prepend(prefix, "transformer.wte"),
             weights=weights,
             reduce=False,
         )
         self.wpe = TensorParallelEmbedding(
-            prefix="transformer.wpe",
+            prefix=prepend(prefix, "transformer.wpe"),
             weights=weights,
             reduce=False,
         )
@@ -390,6 +355,7 @@ class FlashSantacoderModel(nn.Module):
         self.h = nn.ModuleList(
             [
                 Block(
+                    prefix,
                     layer_id,
                     config,
                     weights,
@@ -398,7 +364,7 @@ class FlashSantacoderModel(nn.Module):
             ]
         )
         self.ln_f = FastLayerNorm.load(
-            prefix="transformer.ln_f", weights=weights, eps=config.layer_norm_epsilon
+            prefix=prepend(prefix, "transformer.ln_f"), weights=weights, eps=config.layer_norm_epsilon
         )
 
         self.head_size = self.h[0].attn.head_size
@@ -412,7 +378,7 @@ class FlashSantacoderModel(nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
     ) -> torch.Tensor:
         hidden_states = self.wte(input_ids) + self.wpe(position_ids)
@@ -429,7 +395,7 @@ class FlashSantacoderModel(nn.Module):
                 kv_cache[i],
                 block_tables,
                 slots,
-                input_lengths,
+                seqlen,
                 max_s,
             )
 
@@ -439,12 +405,11 @@ class FlashSantacoderModel(nn.Module):
 
 
 class FlashSantacoderForCausalLM(nn.Module):
-    def __init__(self, config, weights):
+    def __init__(self, prefix: str, config, weights):
         super().__init__()
-        self.transformer = FlashSantacoderModel(config, weights)
-        self.lm_head = TensorParallelHead.load(
-            config, prefix="transformer.wte", weights=weights
-        )
+        self.config = config
+        self.transformer = FlashSantacoderModel(prefix, config, weights)
+        self.lm_head = TensorParallelHead.load(config, prefix=prepend(prefix, "transformer.wte"), weights=weights)
 
     def forward(
         self,
@@ -454,10 +419,12 @@ class FlashSantacoderForCausalLM(nn.Module):
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         block_tables: torch.Tensor,
         slots: torch.Tensor,
-        input_lengths: torch.Tensor,
+        seqlen: Seqlen,
         max_s: int,
+        prefill_cache_indices: Optional[torch.Tensor] = None,
         lm_head_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        skip_lm_head: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         hidden_states = self.transformer(
             input_ids,
             position_ids,
@@ -465,10 +432,14 @@ class FlashSantacoderForCausalLM(nn.Module):
             kv_cache,
             block_tables,
             slots,
-            input_lengths,
+            seqlen,
             max_s,
         )
         if lm_head_indices is not None:
             hidden_states = hidden_states[lm_head_indices]
+
+        if skip_lm_head:
+            return hidden_states, None
+
         logits = self.lm_head(hidden_states)
-        return logits
+        return logits, None

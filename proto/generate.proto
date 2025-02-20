@@ -15,6 +15,10 @@ service LoraxService {
     rpc Warmup (WarmupRequest) returns (WarmupResponse);
     /// Prefill batch and decode first token
     rpc Prefill (PrefillRequest) returns (PrefillResponse);
+    /// Embed
+    rpc Embed (EmbedRequest) returns (EmbedResponse);
+    /// Classify
+    rpc Classify (ClassifyRequest) returns (ClassifyResponse);
     /// Decode token for a list of prefilled batches
     rpc Decode (DecodeRequest) returns (DecodeResponse);
     /// Health check
@@ -30,6 +34,15 @@ service LoraxService {
 message HealthRequest {}
 message HealthResponse {}
 
+message PreloadedAdapter {
+    /// Adapter params
+    AdapterParameters adapter_parameters = 1;
+    /// Adapter source
+    AdapterSource adapter_source = 2;
+    /// Adapter index
+    uint32 adapter_index = 3;
+}
+
 /// Empty request
 message InfoRequest {}
 
@@ -38,6 +51,14 @@ message InfoResponse {
     string dtype = 2;
     string device_type = 3;
     optional uint32 window_size = 4;
+    uint32 block_size = 5;
+    uint32 speculate = 6;
+    repeated PreloadedAdapter preloaded_adapters = 7;
+    bool supports_generation = 8;
+    bool supports_embeddings = 9;
+    bool supports_classification = 10;
+    bool chunked_prefill = 11;
+    bool requires_block_allocator = 12;
 }
 
 /// Empty request
@@ -71,10 +92,18 @@ message NextTokenChooserParameters {
     uint64 seed = 6;
     /// repetition penalty
     float repetition_penalty = 7;
+    /// frequency penalty
+    float frequency_penalty = 8;
+    /// presence penalty
+    float presence_penalty = 9;
     /// token watermarking using "A Watermark for Large Language Models"
-    bool watermark = 8;
+    bool watermark = 10;
     /// adapter to use with lora exchange
-    string adapter_id = 9;
+    string adapter_id = 11;
+    /// JSON schema used for constrained decoding (Outlines)
+    optional string schema = 12;
+    /// returning the k highest probability alternatives
+    uint32 return_k_alternatives = 13;
 }
 
 message StoppingCriteriaParameters {
@@ -87,21 +116,58 @@ message StoppingCriteriaParameters {
     bool ignore_eos_token = 3;
 }
 
+message Image {
+    /// Binary image data.
+    bytes data = 1;
+
+    /// Image MIME type.
+    string mimetype = 2;
+  }
+
+message InputChunk {
+    oneof chunk {
+      /// Plain text data
+      string text = 1;
+      /// Image data
+      Image image = 2;
+    }
+}
+
+message TokenizedInputs {
+    /// Token IDs
+    repeated uint32 ids = 1;
+
+    /// Chunks
+    repeated InputChunk input_chunks = 2;
+}
+
 message Request {
     /// Request ID
     uint64 id = 1;
     /// The generation context
     string inputs = 2;
+    /// Tokenized inputs
+    TokenizedInputs tokenized_inputs = 3;
     /// Context truncation
-    uint32 truncate = 3;
+    uint32 truncate = 4;
     /// Next Token Chooser Parameters
-    NextTokenChooserParameters parameters = 4;
+    NextTokenChooserParameters parameters = 5;
     /// Stopping Criteria Parameters
-    StoppingCriteriaParameters stopping_parameters = 5;
+    StoppingCriteriaParameters stopping_parameters = 6;
     /// Return prefill logprobs
-    bool prefill_logprobs = 6;
+    bool prefill_logprobs = 7;
     /// Adapter index
-    uint32 adapter_index = 7;
+    uint32 adapter_index = 8;
+    /// Paged attention blocks
+    repeated uint32 blocks = 9;
+    /// Paged attention slots
+    repeated uint32 slots = 10;
+    /// Tokens that can be retrieved from the KV cache.
+    /// This value is set for the first prefill and never reset
+    uint32 cache_len = 11;
+    /// Chunk of tokens that must be computed for the first prefill
+    /// This value is set for the first prefill and never reset
+    optional uint32 chunk_len = 12;
 }
 
 message Batch {
@@ -113,6 +179,8 @@ message Batch {
     uint32 size = 3;
     /// Maximum number of tokens this batch will grow to
     uint32 max_tokens = 4;
+    /// Maximum number of Paged Attention blocks
+    uint32 max_blocks = 5;
 }
 
 message CachedBatch {
@@ -124,6 +192,8 @@ message CachedBatch {
     uint32 size = 3;
     /// Maximum number of tokens this batch will grow to
     uint32 max_tokens = 4;
+    /// Number of tokens in the next forward
+    uint32 current_tokens = 5;
 }
 
 enum FinishReason {
@@ -137,36 +207,47 @@ message GeneratedText {
     string text = 1;
     /// Number of generated tokens
     uint32 generated_tokens = 2;
+    /// Number of skipped tokens due to speculative decoding hits
+    uint32 skipped_tokens = 3;
     /// Finish reason
-    FinishReason finish_reason = 3;
+    FinishReason finish_reason = 4;
     /// Seed
-    optional uint64 seed = 4;
+    optional uint64 seed = 5;
 }
 
-message PrefillTokens {
-    /// Prefill Token IDs
+message AlternativeTokens {
+    /// Alternative Token IDs
     repeated uint32 ids = 1;
-    /// Prefill Logprobs
+    /// Alternative Logprobs
     repeated float logprobs = 2;
-    /// Prefill tokens
+    /// Alternative tokens
     repeated string texts = 3;
+}
+
+message NextTokens {
+    /// Token IDs
+    repeated uint32 ids = 1;
+    /// Logprobs
+    repeated float logprobs = 2;
+    /// decoded text for each token
+    repeated string texts = 3;
+    /// is special for each token
+    repeated bool is_special = 4;
+    /// Alternative tokens (optional)
+    repeated AlternativeTokens alternative_tokens = 5;
 }
 
 message Generation {
     /// Request ID
     uint64 request_id = 1;
     /// Prefill tokens (optional)
-    PrefillTokens prefill_tokens = 2;
-    /// Token ID
-    uint32 token_id = 3;
-    /// Logprob
-    float token_logprob = 4;
-    /// Text
-    string token_text = 5;
-    /// Is it a special token
-    bool token_is_special = 6;
+    NextTokens prefill_tokens = 2;
+    /// Next tokens
+    NextTokens next_tokens = 3;
     /// Complete generated text
-    optional GeneratedText generated_text = 7;
+    optional GeneratedText generated_text = 4;
+    /// Prefill tokens length
+    uint32 prefill_tokens_length = 5;
 }
 
 message FilterBatchRequest {
@@ -185,6 +266,8 @@ message FilterBatchResponse {
 message PrefillRequest {
     /// Batch
     Batch batch = 1;
+    /// Optional cached batch
+    CachedBatch cached_batch = 2;
 }
 
 message PrefillResponse {
@@ -192,6 +275,16 @@ message PrefillResponse {
     repeated Generation generations = 1;
     /// Next batch (cached)
     optional CachedBatch batch = 2;
+
+    // TODO(travis): add timings
+    // /// Forward elapsed time in nanoseconds
+    // uint64 forward_ns = 3;
+    // /// Decode elapsed time in nanoseconds
+    // uint64 decode_ns = 4;
+    // /// Total elapsed time in nanoseconds
+    // uint64 total_ns = 5;
+    // /// Concatenate elapsed time in nanoseconds
+    // optional uint64 concat_ns = 6;
 }
 
 message DecodeRequest {
@@ -206,9 +299,71 @@ message DecodeResponse {
     optional CachedBatch batch = 2;
 }
 
+message Embedding {
+    /// Request ID
+    uint64 request_id = 1;
+
+    /// Embedding values
+    repeated float values = 2;
+}
+
+message EmbedRequest {
+    /// Batch
+    Batch batch = 1;
+}
+
+message EmbedResponse {
+    /// Embeddings
+    repeated Embedding embeddings = 1;
+
+    /// Error message on failure
+    string errorMsg = 2;
+}
+
+message Entity {
+    string entity = 1;
+    float score = 2;
+    uint32 index = 3;
+    string word = 4;
+    uint32 start = 5;
+    uint32 end = 6;
+}
+
+message EntityList {
+    /// Request ID
+    uint64 request_id = 1;
+    /// Entities
+    repeated Entity entities = 2;
+    /// XXX
+    repeated uint32 input_ids = 4;
+}
+
+message ClassifyPredictionList {
+    /// Request ID
+    uint64 request_id = 1;
+    /// Classifications
+    repeated string predictions = 2;
+    repeated float scores = 3;
+}
+
+message ClassifyRequest {
+    /// Batch
+    Batch batch = 1;
+}
+
+message ClassifyResponse {
+    /// Classifications
+    repeated ClassifyPredictionList classify_prediction_lists = 1;
+    /// Error message on failure
+    string errorMsg = 2;
+}
+
 message WarmupRequest {
     /// Batch to warmup on
     Batch batch = 1;
+    uint32 max_input_length = 2;
+    uint32 max_prefill_tokens = 3;
+    uint32 max_new_tokens = 4;
 }
 
 /// Empty response
@@ -224,43 +379,89 @@ enum AdapterSource {
     S3 = 1;
     /// Adapters loaded via local filesystem path
     LOCAL = 2;
+    /// Adapters loaded via predibase
+    PBASE = 3;
+}
+
+enum MergeStrategy {
+    /// Linear combination of adapters
+    LINEAR = 0;
+
+    /// TIES method for combining adapters
+    TIES = 1;
+
+    /// DARE method for combining adapters
+    DARE_LINEAR = 2;
+
+    /// DARE + TIES method for combining adapters
+    DARE_TIES = 3;
+}
+
+enum MajoritySignMethod {
+    /// Total method
+    TOTAL = 0;
+
+    /// Frequency method
+    FREQUENCY = 1;
+}
+
+message AdapterParameters {
+    /// Adapter IDs
+    repeated string adapter_ids = 1;
+
+    /// Adapter weights for merging
+    repeated float weights = 2;
+
+    /// Merge strategy (default: linear)
+    MergeStrategy merge_strategy = 3;
+
+    /// [0, 1], 0: full pruning, 1: no pruning
+    float density = 4;
+
+    /// Majority sign method (default: total)
+    MajoritySignMethod majority_sign_method = 5;
 }
 
 message DownloadAdapterRequest {
-    /// Adapter ID
-    string adapter_id = 1;
+    /// Adapter Parameters
+    AdapterParameters adapter_parameters = 1;
     /// Adapter source
     AdapterSource adapter_source = 2;
+    /// Token for external API (predibase / HuggingFace)
+    optional string api_token = 3;
 }
 
 message DownloadAdapterResponse {
-    /// Adapter ID
-    string adapter_id = 1;
-    /// Adapter source
-    AdapterSource adapter_source = 2;
+    /// True if download occurred, false if skipped
+    bool downloaded = 1;
+
+    /// Fraction of the adapter memory limit consumed by the adapter.
+    /// If no limit is set, will return 0.
+    /// When the total across all loaded adapters exceeds
+    /// the adapter_memory_fraction limit, no more adapters
+    /// will be loaded to GPU and LoRAX will begin swapping.
+    float memory_fraction = 2;
 }
 
 message LoadAdapterRequest {
-    /// Adapter ID
-    string adapter_id = 1;
+    /// Adapter Parameters
+    AdapterParameters adapter_parameters = 1;
     /// Adapter source
     AdapterSource adapter_source = 2;
     /// Adapter index
     uint32 adapter_index = 3;
+    /// Token for external API (predibase / HuggingFace)
+    optional string api_token = 4;
 }
 
 message LoadAdapterResponse {
-    /// Adapter ID
-    string adapter_id = 1;
-    /// Adapter source
-    AdapterSource adapter_source = 2;
-    /// Adapter index
-    uint32 adapter_index = 3;
+    /// True if load occurred, false if skipped
+    bool loaded = 1;
 }
 
 message OffloadAdapterRequest {
-    /// Adapter ID
-    string adapter_id = 1;
+    /// Adapter Parameters
+    AdapterParameters adapter_parameters = 1;
     /// Adapter source
     AdapterSource adapter_source = 2;
     /// Adapter index
@@ -268,10 +469,6 @@ message OffloadAdapterRequest {
 }
 
 message OffloadAdapterResponse {
-    /// Adapter ID
-    string adapter_id = 1;
-    /// Adapter source
-    AdapterSource adapter_source = 2;
-    /// Adapter index
-    uint32 adapter_index = 3;
+    /// True if offload occurred, false if skipped
+    bool offloaded = 1;
 }

@@ -11,8 +11,18 @@ model=mistralai/Mistral-7B-Instruct-v0.1
 volume=$PWD/data  # share a volume with the container as a weight cache
 
 docker run --gpus all --shm-size 1g -p 8080:80 -v $volume:/data \
-    ghcr.io/predibase/lorax:latest --model-id $model
+    ghcr.io/predibase/lorax:main --model-id $model
 ```
+
+!!! note
+    
+    The `main` tag will use the image built from the HEAD of the main branch of the repo. For the latest stable image (built from a 
+    tagged version) use the `latest` tag.
+
+!!! note
+    
+    The LoRAX server in the pre-built Docker image is configured to listen on port 80 (instead of on the default port number, which is 3000).
+
 !!! note
     
     To use GPUs, you need to install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). We also recommend using NVIDIA drivers with CUDA version 11.8 or higher.

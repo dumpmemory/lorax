@@ -1,17 +1,26 @@
 import math
-import torch
-
+from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional, List, Dict, Union
+from typing import Dict, List, Optional, Union
 
+import torch
 from transformers import (
-    LogitsWarper,
     LogitsProcessor,
+    LogitsWarper,
+    PreTrainedTokenizerBase,
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
     TypicalLogitsWarper,
 )
+
+try:
+    from outlines.fsm.guide import RegexGuide
+    from outlines.fsm.json_schema import build_regex_from_schema
+
+    HAS_OUTLINES = True
+except ImportError:
+    HAS_OUTLINES = False
 
 mempool = torch.cuda.graph_pool_handle() if torch.cuda.is_available() else None
 
@@ -26,7 +35,7 @@ class StaticWarper:
     ):
         self.warpers = []
 
-        if temperature is not None and temperature != 1.0:
+        if temperature is not None and temperature != 1.0 and temperature != 0:
             temperature = float(temperature)
             self.warpers.append(TemperatureLogitsWarper(temperature))
         if top_k is not None and top_k != 0:
@@ -54,9 +63,7 @@ class StaticWarper:
 
                     self.static_warped_scores = local_scores
                     # Compute logprobs
-                    self.static_next_logprob = torch.log_softmax(
-                        self.static_warped_scores, -1
-                    )
+                    self.static_next_logprob = torch.log_softmax(self.static_warped_scores, -1)
 
             self.static_scores.copy_(scores)
             self.cuda_graph.replay()
@@ -76,9 +83,29 @@ def static_warper(
     top_p: Optional[float],
     typical_p: Optional[float],
 ) -> StaticWarper:
-    return StaticWarper(
-        temperature=temperature, top_k=top_k, top_p=top_p, typical_p=typical_p
-    )
+    return StaticWarper(temperature=temperature, top_k=top_k, top_p=top_p, typical_p=typical_p)
+
+
+class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
+    r"""
+    Frequency penalty as defined by OpenAI
+
+    Args:
+        penalty (`float`):
+            The parameter for frequency penalty. 0.0 means no penalty.
+    """
+
+    def __init__(self, penalty: float):
+        self.penalty = penalty
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        score = torch.gather(scores, 1, input_ids)
+        # if score < 0 then penalty has to be multiplied to reduce the previous token probability
+        score = -torch.where(score < 0, score * self.penalty, score / self.penalty)
+        # set score to 0 where input_ids is a padding token
+        score *= input_ids.ne(0)
+
+        return scores.scatter_add_(1, input_ids, score)
 
 
 class HeterogeneousRepetitionPenaltyLogitsProcessor(LogitsProcessor):
@@ -95,17 +122,13 @@ class HeterogeneousRepetitionPenaltyLogitsProcessor(LogitsProcessor):
 
     def __init__(self, penalty: List[float], dtype: torch.dtype, device: torch.device):
         self.penalty = penalty
-        self.penalty_tensor = torch.tensor(
-            penalty, dtype=dtype, device=device
-        ).unsqueeze(1)
+        self.penalty_tensor = torch.tensor(penalty, dtype=dtype, device=device).unsqueeze(1)
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         score = torch.gather(scores, 1, input_ids)
 
         # if score < 0 then repetition penalty has to be multiplied to reduce the previous token probability
-        score = torch.where(
-            score < 0, score * self.penalty_tensor, score / self.penalty_tensor
-        )
+        score = torch.where(score < 0, score * self.penalty_tensor, score / self.penalty_tensor)
 
         scores.scatter_(1, input_ids, score)
         return scores
@@ -118,7 +141,54 @@ class HeterogeneousRepetitionPenaltyLogitsProcessor(LogitsProcessor):
         return None
 
 
-class HeterogeneousTemperatureLogitsWarper:
+class HeterogeneousFrequencyPenaltyLogitsProcessor(LogitsProcessor):
+    r"""
+    Frequency penalty as defined by OpenAI in
+    https://platform.openai.com/docs/guides/text-generation/parameter-details
+
+    Args:
+        frequency_penalty (`List[float]`):
+            The parameter for frequency penalty. 0.0 means no penalty.
+        presence_penalty (`List[float]`):
+            The parameter for presence penalty. 0.0 means no penalty.
+    """
+
+    def __init__(
+        self, frequency_penalty: List[float], presence_penalty: List[float], dtype: torch.dtype, device: torch.device
+    ):
+        self.frequency_penalty = frequency_penalty
+        self.frequency_penalty_tensor = torch.tensor(frequency_penalty, dtype=dtype, device=device).unsqueeze(1)
+
+        self.presence_penalty = presence_penalty
+        self.presence_penalty_tensor = torch.tensor(presence_penalty, dtype=dtype, device=device).unsqueeze(1)
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        batch_size, input_size = input_ids.size()
+        vocab_size = scores.size(1)
+
+        # Calculate the frequency for each token so far
+        token_freq = torch.zeros(batch_size, vocab_size, device=input_ids.device)
+        token_freq.scatter_add_(1, input_ids, torch.ones_like(input_ids, dtype=torch.float))
+        mask = token_freq > 0
+        token_freq /= input_size
+
+        # Apply the frequency and presence penalties to logits
+        scores -= token_freq * self.frequency_penalty_tensor
+        scores -= mask * self.presence_penalty_tensor
+
+        return scores
+
+    def filter(self, indices):
+        self.frequency_penalty = [self.frequency_penalty[i] for i in indices]
+        self.presence_penalty = [self.presence_penalty[i] for i in indices]
+        if any([x != 0.0 for x in self.frequency_penalty]) or any([x != 0.0 for x in self.presence_penalty]):
+            self.frequency_penalty_tensor = self.frequency_penalty_tensor[indices]
+            self.presence_penalty_tensor = self.presence_penalty_tensor[indices]
+            return self
+        return None
+
+
+class HeterogeneousTemperatureLogitsWarper(LogitsWarper):
     r"""
     [`LogitsWarper`] for temperature (exponential scaling output probability distribution).
     This version allows for a separate value for each sample and runs inplace when possible.
@@ -129,13 +199,9 @@ class HeterogeneousTemperatureLogitsWarper:
             The value used to module the logits distribution.
     """
 
-    def __init__(
-        self, temperature: List[float], dtype: torch.dtype, device: torch.device
-    ):
+    def __init__(self, temperature: List[float], dtype: torch.dtype, device: torch.device):
         self.temperature = temperature
-        self.temperature_tensor = torch.tensor(
-            temperature, dtype=dtype, device=device
-        ).unsqueeze(1)
+        self.temperature_tensor = torch.tensor(temperature, dtype=dtype, device=device).unsqueeze(1)
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         scores.div_(self.temperature_tensor)
@@ -174,9 +240,7 @@ class HeterogeneousTopPLogitsWarper(LogitsWarper):
         min_tokens_to_keep: int = 1,
     ):
         self.top_p = top_p
-        self.top_p_opposite = 1 - torch.tensor(
-            top_p, dtype=dtype, device=device
-        ).unsqueeze(1)
+        self.top_p_opposite = 1 - torch.tensor(top_p, dtype=dtype, device=device).unsqueeze(1)
         self.filter_value = filter_value
         self.min_tokens_to_keep = min_tokens_to_keep
 
@@ -193,9 +257,7 @@ class HeterogeneousTopPLogitsWarper(LogitsWarper):
         sorted_indices_to_remove[..., -self.min_tokens_to_keep :] = 0
 
         # scatter sorted tensors to original indexing
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            1, sorted_indices, sorted_indices_to_remove
-        )
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
         warped_scores = scores.masked_fill_(indices_to_remove, self.filter_value)
 
         return warped_scores
@@ -243,9 +305,7 @@ class HeterogeneousTopKLogitsWarper(LogitsWarper):
         disabled = [x == 0 for x in top_k]
 
         if any(disabled):
-            self.top_k_disabled_mask = torch.tensor(
-                disabled, dtype=torch.bool, device=device
-            ).view(-1, 1)
+            self.top_k_disabled_mask = torch.tensor(disabled, dtype=torch.bool, device=device).view(-1, 1)
         else:
             self.top_k_disabled_mask = None
 
@@ -281,9 +341,7 @@ class HeterogeneousTopKLogitsWarper(LogitsWarper):
             self.max_top_k = max(self.top_k)
 
             if self.top_k_disabled_mask is not None:
-                self.top_k_disabled_mask = (
-                    self.top_k_disabled_mask[indices] if any(disabled) else None
-                )
+                self.top_k_disabled_mask = self.top_k_disabled_mask[indices] if any(disabled) else None
 
             return self
         return None
@@ -349,15 +407,11 @@ class HeterogeneousTypicalLogitsWarper(LogitsWarper):
         if self.disabled_mask is not None:
             last_ind.masked_fill_(self.disabled_mask, scores.shape[-1] - 1)
 
-        sorted_indices_to_remove = sorted_scores > sorted_scores.gather(
-            1, last_ind.view(-1, 1)
-        )
+        sorted_indices_to_remove = sorted_scores > sorted_scores.gather(1, last_ind.view(-1, 1))
         if self.min_tokens_to_keep > 1:
             # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
             sorted_indices_to_remove[..., : self.min_tokens_to_keep] = 0
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            1, sorted_indices, sorted_indices_to_remove
-        )
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
 
         warped_scores = scores.masked_fill_(indices_to_remove, self.filter_value)
 
@@ -371,9 +425,7 @@ class HeterogeneousTypicalLogitsWarper(LogitsWarper):
             self.mass_tensor = self.mass_tensor[indices]
 
             if self.disabled_mask is not None:
-                self.disabled_mask = (
-                    self.disabled_mask[indices] if any(disabled) else None
-                )
+                self.disabled_mask = self.disabled_mask[indices] if any(disabled) else None
 
             return self
         return None
@@ -408,3 +460,143 @@ class HeterogeneousProcessorWrapper(LogitsProcessor):
             self.processors = new_processors
             return self
         return None
+
+
+class HeterogeneousSchemaLogitsProcessor(LogitsProcessor):
+    """
+    [`LogitsWarper`] for JSON schema enforcement.
+    This version uses Outlines to perform the constrained decoding.
+
+    Args:
+        sequence_processors (`List[Optional[OutlinesLogitsProcessor]]`):
+            The Outlines processors to use for each request.
+    """
+
+    def __init__(
+        self,
+        sequence_processors: List[Optional["OutlinesLogitsProcessor"]],
+    ):
+        self.sequence_processors = sequence_processors
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        for i, processor in enumerate(self.sequence_processors):
+            if processor is not None:
+                scores[i : i + 1] = processor(scores[i : i + 1])
+        return scores
+
+    def filter(self, indices):
+        self.sequence_processors = [self.sequence_processors[i] for i in indices]
+        if any([x is not None for x in self.sequence_processors]):
+            return self
+        return None
+
+    def next_state(self, batch_idx: int, next_token_id: int):
+        if self.sequence_processors[batch_idx] is not None:
+            self.sequence_processors[batch_idx].next_state(next_token_id)
+
+    @contextmanager
+    def restore_state(self):
+        states = [processor.fsm_state if processor is not None else None for processor in self.sequence_processors]
+        try:
+            yield
+        finally:
+            for i, state in enumerate(states):
+                if state is not None:
+                    self.sequence_processors[i].fsm_state = state
+
+    @classmethod
+    def from_schemas(
+        cls,
+        schemas: List[Optional[str]],
+        tokenizers: List[Optional[PreTrainedTokenizerBase]],
+    ) -> "HeterogeneousSchemaLogitsProcessor":
+        """
+        Args:
+            schemas (`List[Optional[str]]`):
+                The JSON encoded schemas to enforce. `None` means no enforcement.
+            tokenizers (`List[Optional[PreTrainedTokenizerBase]]`):
+                The tokenizers to use for each request.
+        """
+        if schemas is None:
+            schemas = []
+        if tokenizers is None:
+            tokenizers = []
+
+        sequence_processors = [
+            OutlinesLogitsProcessor(schema, tokenizer) if schema and tokenizer else None
+            for schema, tokenizer in zip(schemas, tokenizers)
+        ]
+        return cls(sequence_processors)
+
+
+# Source: https://github.com/outlines-dev/outlines/blob/main/outlines/serve/vllm.py
+class OutlinesLogitsProcessor(LogitsProcessor):
+    def __init__(self, schema: str, tokenizer: PreTrainedTokenizerBase):
+        """Compile the FSM that drives the regex-guided generation.
+
+        Args:
+            schema (str):
+                JSON schema to enforce.
+            tokenizer (PreTrainedTokenizerBase):
+                The tokenizer to use for the FSM.
+        """
+        if not HAS_OUTLINES:
+            raise ImportError("Unable to enforce JSON schema: `outlines` is not installed.")
+
+        self.tokenizer = OutlinesLogitsProcessor.adapt_tokenizer(tokenizer)
+        self.fsm = OutlinesLogitsProcessor.compile_fsm(schema, self.tokenizer)
+        self.fsm_state = 0
+
+    def __call__(self, scores: torch.Tensor) -> torch.Tensor:
+        if self.fsm_state == -1 or self.fsm is None:
+            return scores
+
+        allowed_tokens = self.fsm.get_next_instruction(self.fsm_state).tokens
+
+        mask = torch.full_like(scores, -math.inf, device=scores.device)
+        if allowed_tokens is not None:
+            mask[:, allowed_tokens] = 0
+        biased_scores = scores + mask
+
+        return biased_scores
+
+    def next_state(self, next_token_id: int):
+        if self.fsm_state != -1:
+            self.fsm_state = self.fsm.get_next_state(self.fsm_state, next_token_id)
+
+    @staticmethod
+    @lru_cache(maxsize=32, typed=True)
+    def compile_fsm(schema, tokenizer):
+        regex_string = build_regex_from_schema(schema)
+        return RegexGuide.from_regex(regex_string, tokenizer)
+
+    @staticmethod
+    @lru_cache(maxsize=32, typed=True)
+    def adapt_tokenizer(tokenizer: PreTrainedTokenizerBase):
+        """Adapt the HF tokenizer to use to compile the FSM.
+
+        The API of Outlines tokenizers is slightly different to that of
+        `transformers`. In addition, we need to handle the missing spaces to
+        Llama's tokenizer to be able to compile FSMs for this model.
+        """
+        if hasattr(tokenizer, "vocabulary"):
+            # We've already adapted the tokenizer from a previous request
+            return tokenizer
+
+        tokenizer.vocabulary = tokenizer.get_vocab()
+        tokenizer.special_tokens = set(tokenizer.all_special_tokens)
+
+        def convert_token_to_string(token: str) -> str:
+            from transformers.file_utils import SPIECE_UNDERLINE
+
+            string = tokenizer.convert_tokens_to_string([token])
+
+            # A hack to handle missing spaces to HF's Llama tokenizers
+            if token.startswith(SPIECE_UNDERLINE) or token == "<0x20>":
+                return " " + string
+
+            return string
+
+        tokenizer.convert_token_to_string = convert_token_to_string
+
+        return tokenizer

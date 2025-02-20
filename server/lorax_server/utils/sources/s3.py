@@ -1,24 +1,61 @@
 import os
 import time
 from datetime import timedelta
-from typing import Optional, List, Any
-
-from loguru import logger
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
-
-
 from huggingface_hub.utils import (
-    LocalEntryNotFoundError,
     EntryNotFoundError,
+    LocalEntryNotFoundError,
 )
+from loguru import logger
 
 from .source import BaseModelSource, try_to_load_from_cache
 
+if TYPE_CHECKING:
+    from boto3.resources.factory.s3 import Bucket
 
-def _get_bucket_resource():
+
+S3_PREFIX = "s3://"
+
+
+def _get_bucket_and_model_id(model_id: str) -> Tuple[str, str]:
+    if model_id.startswith(S3_PREFIX):
+        model_id_no_protocol = model_id[len(S3_PREFIX) :]
+        if "/" not in model_id_no_protocol:
+            raise ValueError(
+                f"Invalid model_id {model_id}. " f"model_id should be of the form `s3://bucket_name/model_id`"
+            )
+        bucket_name, model_id = model_id_no_protocol.split("/", 1)
+        return bucket_name, model_id
+
+    bucket = os.getenv("PREDIBASE_MODEL_BUCKET")
+    folder = os.getenv("PREDIBASE_MODEL_FOLDER", "")
+    if not bucket:
+        # assume that the id preceding the first slash is the bucket name
+        if "/" not in model_id:
+            raise ValueError(
+                f"Invalid model_id {model_id}. "
+                f"model_id should be of the form `bucket_name/model_id` "
+                f"if PREDIBASE_MODEL_BUCKET environment variable is not set"
+            )
+
+        bucket_name, model_id = model_id.split("/", 1)
+        return bucket_name, model_id
+
+    if folder:
+        # Make sure to append / if its not present
+        if not folder.endswith("/"):
+            folder += "/"
+        model_id = folder + model_id
+    return bucket, model_id
+
+
+def _get_bucket_resource(bucket_name: str) -> "Bucket":
     """Get the s3 client"""
     config = Config(
         retries=dict(
@@ -26,11 +63,19 @@ def _get_bucket_resource():
             mode="standard",
         )
     )
-    s3 = boto3.resource('s3', config=config)
-    bucket = os.getenv("PREDIBASE_MODEL_BUCKET")
-    if not bucket:
-        raise ValueError("PREDIBASE_MODEL_BUCKET environment variable is not set")
-    return s3.Bucket(bucket)
+
+    S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", None)
+    R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", None)
+
+    if R2_ACCOUNT_ID:
+        s3 = boto3.resource("s3", endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com", config=config)
+        return s3.Bucket(bucket_name)
+    elif S3_ENDPOINT_URL:
+        s3 = boto3.resource("s3", endpoint_url=f"{S3_ENDPOINT_URL}", config=config)
+        return s3.Bucket(bucket_name)
+    else:
+        s3 = boto3.resource("s3", config=config)
+        return s3.Bucket(bucket_name)
 
 
 def get_s3_model_local_dir(model_id: str):
@@ -39,9 +84,7 @@ def get_s3_model_local_dir(model_id: str):
     return repo_cache
 
 
-def weight_s3_files(
-    bucket: Any, model_id: str, extension: str = ".safetensors"
-) -> List[str]:
+def weight_s3_files(bucket: Any, model_id: str, extension: str = ".safetensors") -> List[str]:
     """Get the weights filenames from s3"""
     model_files = bucket.objects.filter(Prefix=model_id)
     filenames = [f.key.removeprefix(model_id).lstrip("/") for f in model_files if f.key.endswith(extension)]
@@ -54,9 +97,13 @@ def weight_s3_files(
 
 
 def download_files_from_s3(
-    bucket: Any, filenames: List[str], model_id: str, revision: str = "",
+    bucket: Any,
+    filenames: List[str],
+    model_id: str,
+    revision: str = "",
 ) -> List[Path]:
     """Download the safetensors files from the s3"""
+
     def download_file(filename):
         repo_cache = get_s3_model_local_dir(model_id)
         local_file = try_to_load_from_cache(repo_cache, revision, filename)
@@ -73,9 +120,7 @@ def download_files_from_s3(
         logger.info(f"Downloading file {bucket_file_name} to {local_file_path}")
         bucket.download_file(str(bucket_file_name), str(local_file_path))
         # TODO: add support for revision
-        logger.info(
-            f"Downloaded {local_file_path} in {timedelta(seconds=int(time.time() - start_time))}."
-        ) 
+        logger.info(f"Downloaded {local_file_path} in {timedelta(seconds=int(time.time() - start_time))}.")
         if not local_file_path.is_file():
             raise FileNotFoundError(f"File {local_file_path} not found")
         return local_file_path
@@ -98,18 +143,14 @@ def download_files_from_s3(
     return files
 
 
-def weight_files_s3(
-    bucket: Any, model_id: str, revision: str = "", extension: str = ".safetensors"
-) -> List[Path]:
+def weight_files_s3(bucket: Any, model_id: str, revision: str = "", extension: str = ".safetensors") -> List[Path]:
     """Get the local files"""
     # Local model
     local_path = get_s3_model_local_dir(model_id)
     if local_path.exists() and local_path.is_dir():
         local_files = list(local_path.glob(f"*{extension}"))
         if not local_files:
-            raise FileNotFoundError(
-                f"No local weights found in {model_id} with extension {extension}"
-            )
+            raise FileNotFoundError(f"No local weights found in {model_id} with extension {extension}")
         return local_files
 
     try:
@@ -122,16 +163,12 @@ def weight_files_s3(
         # Change pytorch extension to safetensors extension
         # It is possible that we have safetensors weights locally even though they are not on the
         # hub if we converted weights locally without pushing them
-        filenames = [
-            f"{Path(f).stem.lstrip('pytorch_')}.safetensors" for f in pt_filenames
-        ]
+        filenames = [f"{Path(f).stem.lstrip('pytorch_')}.safetensors" for f in pt_filenames]
 
     repo_cache = get_s3_model_local_dir(model_id)
     files = []
     for filename in filenames:
-        cache_file = try_to_load_from_cache(
-            repo_cache, revision, filename
-        )
+        cache_file = try_to_load_from_cache(repo_cache, revision, filename)
         if cache_file is None:
             raise LocalEntryNotFoundError(
                 f"File {filename} of model {model_id} not found in "
@@ -172,10 +209,15 @@ class S3ModelSource(BaseModelSource):
             raise ValueError(f"model_id '{model_id}' is too short for prefix filtering")
 
         # TODO: add support for revisions of the same model
+        bucket, model_id = _get_bucket_and_model_id(model_id)
         self.model_id = model_id
         self.revision = revision
         self.extension = extension
-        self.bucket = _get_bucket_resource()
+        self.bucket = _get_bucket_resource(bucket)
+
+    @property
+    def api_token(self) -> Optional[str]:
+        return None
 
     def remote_weight_files(self, extension: str = None):
         extension = extension or self.extension
@@ -184,7 +226,7 @@ class S3ModelSource(BaseModelSource):
     def weight_files(self, extension: str = None):
         extension = extension or self.extension
         return weight_files_s3(self.bucket, self.model_id, self.revision, extension)
-    
+
     def download_weights(self, filenames: List[str]):
         return download_files_from_s3(self.bucket, filenames, self.model_id, self.revision)
 
@@ -192,4 +234,15 @@ class S3ModelSource(BaseModelSource):
         return download_model_from_s3(self.bucket, self.model_id, self.extension)
 
     def get_local_path(self, model_id: str):
+        _, model_id = _get_bucket_and_model_id(model_id)
         return get_s3_model_local_dir(model_id)
+
+    def download_file(self, filename: str, ignore_errors: bool = False) -> Optional[Path]:
+        filenames = [filename]
+        try:
+            paths = download_files_from_s3(self.bucket, filenames, self.model_id, self.revision)
+            return paths[0]
+        except ClientError as e:
+            if ignore_errors:
+                return None
+            raise e

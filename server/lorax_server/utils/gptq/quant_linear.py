@@ -1,12 +1,14 @@
 import math
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.cuda.amp import custom_fwd
 
 try:
     import triton
     import triton.language as tl
+
     from . import custom_autotune
 
     # code based https://github.com/fpgaminer/GPTQ-triton
@@ -152,14 +154,11 @@ try:
         offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         offs_k = tl.arange(0, BLOCK_SIZE_K)
-        a_ptrs = a_ptr + (
-            offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-        )  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
         a_mask = offs_am[:, None] < M
         # b_ptrs is set up such that it repeats elements along the K axis 8 times
         b_ptrs = b_ptr + (
-            (offs_k[:, None] // infearure_per_bits) * stride_bk
-            + offs_bn[None, :] * stride_bn
+            (offs_k[:, None] // infearure_per_bits) * stride_bk + offs_bn[None, :] * stride_bn
         )  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         g_ptrs = g_ptr + offs_k
         # shifter is used to extract the N bits of each element in the 32-bit word from B
@@ -174,12 +173,8 @@ try:
             g_idx = tl.load(g_ptrs)
 
             # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
-            scales = tl.load(
-                scales_ptrs + g_idx[:, None] * stride_scales
-            )  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
-            zeros = tl.load(
-                zeros_ptrs + g_idx[:, None] * stride_zeros
-            )  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
+            scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
+            zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
 
             zeros = (zeros >> zeros_shifter[None, :]) & maxq
             zeros = zeros + 1
@@ -200,18 +195,15 @@ try:
         c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
-except:
+except Exception:
     print("triton not installed.")
 
 
 def matmul248(input, qweight, scales, qzeros, g_idx, bits, maxq):
     with torch.cuda.device(input.device):
-        output = torch.empty(
-            (input.shape[0], qweight.shape[1]), device=input.device, dtype=torch.float16
-        )
-        grid = lambda META: (
-            triton.cdiv(input.shape[0], META["BLOCK_SIZE_M"])
-            * triton.cdiv(qweight.shape[1], META["BLOCK_SIZE_N"]),
+        output = torch.empty((input.shape[0], qweight.shape[1]), device=input.device, dtype=torch.float16)
+        grid = lambda META: (  # noqa: E731
+            triton.cdiv(input.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(qweight.shape[1], META["BLOCK_SIZE_N"]),
         )
         matmul_248_kernel[grid](
             input,
@@ -275,12 +267,8 @@ class QuantLinear(nn.Module):
             (math.ceil(infeatures / groupsize), outfeatures // 32 * bits),
             dtype=torch.int32,
         )
-        scales = torch.zeros(
-            (math.ceil(infeatures / groupsize), outfeatures), dtype=torch.float16
-        )
-        g_idx = torch.tensor(
-            [i // groupsize for i in range(infeatures)], dtype=torch.int32
-        )
+        scales = torch.zeros((math.ceil(infeatures / groupsize), outfeatures), dtype=torch.float16)
+        g_idx = torch.tensor([i // groupsize for i in range(infeatures)], dtype=torch.int32)
         if bias:
             bias = torch.zeros((outfeatures), dtype=torch.float16)
         else:
@@ -301,16 +289,13 @@ class QuantLinear(nn.Module):
         for idx in range(self.infeatures):
             intweight.append(
                 torch.round(
-                    (linear.weight.data[:, idx] + scale_zeros[self.g_idx[idx]])
-                    / self.scales[self.g_idx[idx]]
+                    (linear.weight.data[:, idx] + scale_zeros[self.g_idx[idx]]) / self.scales[self.g_idx[idx]]
                 ).to(torch.int)[:, None]
             )
         intweight = torch.cat(intweight, dim=1)
         intweight = intweight.t().contiguous()
         intweight = intweight.numpy().astype(np.uint32)
-        qweight = np.zeros(
-            (intweight.shape[0] // 32 * self.bits, intweight.shape[1]), dtype=np.uint32
-        )
+        qweight = np.zeros((intweight.shape[0] // 32 * self.bits, intweight.shape[1]), dtype=np.uint32)
         i = 0
         row = 0
         while row < qweight.shape[0]:
@@ -327,9 +312,7 @@ class QuantLinear(nn.Module):
 
         zeros -= 1
         zeros = zeros.numpy().astype(np.uint32)
-        qzeros = np.zeros(
-            (zeros.shape[0], zeros.shape[1] // 32 * self.bits), dtype=np.uint32
-        )
+        qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // 32 * self.bits), dtype=np.uint32)
         i = 0
         col = 0
         while col < qzeros.shape[1]:
@@ -357,7 +340,7 @@ class QuantLinear(nn.Module):
         )
         out = out + self.bias if self.bias is not None else out
         return out.reshape(out_shape)
-    
+
     @property
     def weight(self) -> torch.Tensor:
         return self.qweight

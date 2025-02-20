@@ -7,30 +7,9 @@ use std::{
 };
 
 use tokio::{sync::Notify, time::Instant};
-use tracing::{info_span, Span};
+use tracing::info_span;
 
-use crate::{
-    adapter::Adapter,
-    infer::{InferError, InferStreamResponse},
-    validation::ValidGenerateRequest,
-};
-
-/// AdapterLoader entry
-#[derive(Debug)]
-pub(crate) struct Entry {
-    /// Request
-    pub request: ValidGenerateRequest,
-    /// Response sender to communicate between the Infer struct and the batching_task
-    pub response_tx: flume::Sender<Result<InferStreamResponse, InferError>>,
-    /// Span that will live as long as entry
-    pub span: Span,
-    /// Temporary span used as a guard when logging inference, wait times...
-    pub temp_span: Option<Span>,
-    /// Instant when this entry was queued
-    pub queue_time: Instant,
-    /// Instant when this entry was added to a batch
-    pub batch_time: Option<Instant>,
-}
+use crate::{adapter::Adapter, batch::Entry};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum AdapterStatus {
@@ -66,6 +45,9 @@ pub(crate) struct QueueState {
     /// Adapter status
     status: AdapterStatus,
 
+    /// Cost as a fraction of the adapter memory budget
+    cost: Option<f32>,
+
     /// Timestamp when the adapter was last activated
     activation_ts: Option<Instant>,
 
@@ -80,6 +62,7 @@ impl QueueState {
             entries: VecDeque::with_capacity(128),
             adapter,
             status,
+            cost: None,
             activation_ts: None,
             event,
         }
@@ -134,13 +117,21 @@ impl QueueState {
         self.event.batching_task.notify_one();
         tracing::info!(
             "set adapter {} status to {}",
-            self.adapter.id(),
+            self.adapter.as_string(),
             self.status
         );
     }
 
     pub(crate) fn status(&self) -> &AdapterStatus {
         &self.status
+    }
+
+    pub(crate) fn set_cost(&mut self, cost: f32) {
+        self.cost = Some(cost);
+    }
+
+    pub(crate) fn cost(&self) -> Option<f32> {
+        self.cost
     }
 
     pub(crate) fn set_activation_ts(&mut self, ts: Instant) {
@@ -169,6 +160,9 @@ pub(crate) struct AdapterQueuesState {
     /// Number of adapters that can be active at a time
     max_active_adapters: usize,
 
+    /// Fraction of adapter memory budget remaining to allocate to new adapters
+    memory_budget_remaining: f32,
+
     /// Maximum time an adapter is allowed to be active before exchanging out
     max_active_time: Duration,
 
@@ -189,6 +183,7 @@ impl AdapterQueuesState {
             active_adapters,
             tracked_adapters,
             max_active_adapters: max_active_adapters,
+            memory_budget_remaining: 1.0,
             max_active_time: Duration::from_secs(adapter_cycle_time_s),
             next_id: 0,
         }
@@ -255,11 +250,22 @@ impl AdapterQueuesState {
         errored_adapters
     }
 
+    pub(crate) fn set_cost(&mut self, adapter: &Adapter, cost: f32) {
+        let q = self.queue_map.get_mut(adapter);
+        if q.is_none() {
+            // TODO(travis): remove this
+            tracing::error!("adapter {} not found in queue_map", adapter.as_string());
+            println!("{:?}", Backtrace::force_capture());
+        }
+        let queue = q.unwrap();
+        queue.set_cost(cost);
+    }
+
     pub(crate) fn set_status(&mut self, adapter: &Adapter, status: AdapterStatus) {
         let q = self.queue_map.get_mut(adapter);
         if q.is_none() {
             // TODO(travis): remove this
-            tracing::error!("adapter {} not found in queue_map", adapter.id());
+            tracing::error!("adapter {} not found in queue_map", adapter.as_string());
             println!("{:?}", Backtrace::force_capture());
         }
         let queue = q.unwrap();
@@ -299,7 +305,7 @@ impl AdapterQueuesState {
         let mut oldest_within_limit_adapter = None;
         let mut oldest_within_limit_ts = Instant::now();
         for adapter in self.active_adapters.iter() {
-            let queue = self.queue_map.get(adapter).unwrap().clone();
+            let queue = self.queue_map.get(adapter).unwrap();
             if queue.is_empty() || queue.status() != &AdapterStatus::Ready {
                 continue;
             }
@@ -341,7 +347,7 @@ impl AdapterQueuesState {
         let now = Instant::now();
         let mut adapters_to_remove = HashSet::new();
         for adapter in self.active_adapters.iter() {
-            let queue = self.queue_map.get(adapter).unwrap().clone();
+            let queue = self.queue_map.get(adapter).unwrap();
             if adapters_in_use.contains(&queue.adapter()) {
                 // Cannot modify active adapters that are in use
                 continue;
@@ -357,6 +363,9 @@ impl AdapterQueuesState {
                 adapters_to_remove.insert(adapter.clone());
 
                 // Start async offload process
+                // TODO(travis): we're being too aggressive about offloading here, we should only
+                // add adapters to this set if the number of active adapters is full and there are new adapters
+                // waiting to be loaded
                 offload_adapters.push(adapter.clone());
             }
         }
@@ -372,7 +381,7 @@ impl AdapterQueuesState {
         // have been active over the limit.
         if !self.active_adapters.is_empty() {
             let adapter = self.active_adapters.front().unwrap().clone();
-            let queue = self.queue_map.get(&adapter).unwrap().clone();
+            let queue = self.queue_map.get(&adapter).unwrap();
             if !adapters_in_use.contains(&queue.adapter())
                 && now.duration_since(queue.activation_ts().unwrap()) > self.max_active_time
                 && self.pending_adapters.len() >= 1
@@ -385,20 +394,57 @@ impl AdapterQueuesState {
             }
         }
 
+        // Add back cost for all offload adapters
+        for adapter in offload_adapters.iter() {
+            let queue = self.queue_map.get(adapter).unwrap();
+            let cost = queue.cost().unwrap();
+            self.memory_budget_remaining += cost;
+            tracing::info!(
+                "offloading adapter {} with cost {} (memory budget remaining: {})",
+                adapter.as_string(),
+                cost,
+                self.memory_budget_remaining
+            );
+        }
+
         // Add pending adapters to the active set until we reach the max
         while self.active_adapters.len() < self.max_active_adapters
             && self.pending_adapters.len() > 0
         {
-            let adapter = self.pending_adapters.pop_front().unwrap();
+            let queue = self
+                .queue_map
+                .get_mut(self.pending_adapters.front().unwrap())
+                .unwrap();
+            if queue.cost().is_none() {
+                // Adapter has not been downloaded yet
+                break;
+            }
+
+            // Check to see that we have enough memory budget remaining to load the adapter
+            let cost = queue.cost().unwrap();
+            if cost > self.memory_budget_remaining {
+                // Adapter is too expensive to load
+                break;
+            }
 
             // Update activation timestamp
-            let queue = self.queue_map.get_mut(&adapter).unwrap();
+            let adapter = self.pending_adapters.pop_front().unwrap();
             queue.set_activation_ts(now);
+
+            // Calculate remaining memory budget
+            self.memory_budget_remaining -= cost;
 
             // Start async loading process
             load_adapters.push(adapter.clone());
 
             self.active_adapters.push_back(adapter.clone());
+
+            tracing::info!(
+                "loading adapter {} with cost {} (memory budget remaining: {})",
+                adapter.as_string(),
+                cost,
+                self.memory_budget_remaining
+            );
         }
 
         (offload_adapters, load_adapters)

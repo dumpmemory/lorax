@@ -1,20 +1,23 @@
-import torch
-import inspect
-
 from dataclasses import dataclass
-from opentelemetry import trace
-from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
-from typing import Optional, Tuple, List, Type, Dict
+from typing import Dict, List, Optional, Tuple, Type
 
-from lorax_server.models import Model
+import torch
+from loguru import logger
+from opentelemetry import trace
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+
+from lorax_server.adapters import AdapterBatchData, AdapterBatchMetadata
+from lorax_server.models.model import Model
 from lorax_server.models.types import (
     Batch,
-    PrefillTokens,
-    Generation,
     GeneratedText,
+    Generation,
+    NextTokens,
 )
 from lorax_server.pb import generate_pb2
-from lorax_server.utils import NextTokenChooser, StoppingCriteria, Sampling
+from lorax_server.utils import NextTokenChooser, Sampling, StoppingCriteria
+from lorax_server.utils.segments import SegmentConcatBuilder, find_segments
+from lorax_server.utils.tokenizer import TokenizerManager
 
 tracer = trace.get_tracer(__name__)
 
@@ -44,7 +47,7 @@ class CausalLMBatch(Batch):
     stopping_criterias: List[StoppingCriteria]
 
     # Adapter metadata for each request
-    adapter_indices: torch.Tensor
+    adapter_meta: AdapterBatchMetadata
 
     # Metadata used for padding
     max_input_length: int
@@ -69,6 +72,9 @@ class CausalLMBatch(Batch):
         cls,
         pb: generate_pb2.Batch,
         tokenizer: PreTrainedTokenizerBase,
+        tokenizers: TokenizerManager,
+        processor,
+        config,
         dtype: torch.dtype,
         device: torch.device,
     ) -> "CausalLMBatch":
@@ -84,20 +90,19 @@ class CausalLMBatch(Batch):
         padding_right_offset = 0
         max_decode_tokens = 0
         adapter_indices_list = []
+        adapter_list = []
         for i, r in enumerate(pb.requests):
             requests_idx_mapping[r.id] = i
-            inputs.append(r.inputs)
-            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device))
-            stopping_criteria = StoppingCriteria.from_pb(
-                r.stopping_parameters, tokenizer
-            )
+            req_inputs = tokenizers.get_inputs(r, tokenizer)
+            inputs.append(req_inputs)
+            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device, tokenizer))
+            stopping_criteria = StoppingCriteria.from_pb(r.stopping_parameters, tokenizer)
             stopping_criterias.append(stopping_criteria)
             max_truncation = max(max_truncation, r.truncate)
             max_decode_tokens += stopping_criteria.max_new_tokens
-            padding_right_offset = max(
-                padding_right_offset, stopping_criteria.max_new_tokens
-            )
+            padding_right_offset = max(padding_right_offset, stopping_criteria.max_new_tokens)
             adapter_indices_list.append(r.adapter_index)
+            adapter_list.append(r.adapter_index)
 
         adapter_indices = torch.tensor(adapter_indices_list, dtype=torch.int64, device=device)
 
@@ -119,9 +124,7 @@ class CausalLMBatch(Batch):
 
         input_ids = tokenized_inputs["input_ids"]
         # Allocate maximum attention_mask
-        attention_mask = input_ids.new_zeros(
-            (pb.size, max_input_length + padding_right_offset)
-        )
+        attention_mask = input_ids.new_zeros((pb.size, max_input_length + padding_right_offset))
         # Copy tokenizer attention_mask into fully allocated attention_mask
         attention_mask[:, :max_input_length] = tokenized_inputs["attention_mask"]
 
@@ -130,6 +133,9 @@ class CausalLMBatch(Batch):
         all_input_ids = tokenized_inputs["input_ids"].T.split(1, dim=1)
 
         max_tokens = len(inputs) * (max_input_length + max_decode_tokens)
+
+        adapter_segments, adapter_segment_indices = find_segments(adapter_indices)
+        adapter_segments = torch.tensor(adapter_segments, dtype=torch.int32, device=device)
 
         return cls(
             batch_id=pb.id,
@@ -148,7 +154,13 @@ class CausalLMBatch(Batch):
             max_input_length=max_input_length.item(),
             padding_right_offset=padding_right_offset,
             max_tokens=max_tokens,
-            adapter_indices=adapter_indices,
+            adapter_meta=AdapterBatchMetadata(
+                adapter_indices=adapter_indices,
+                adapter_list=adapter_list,
+                adapter_set=set(adapter_list),
+                adapter_segments=adapter_segments,
+                segment_indices=adapter_segment_indices,
+            ),
         )
 
     @tracer.start_as_current_span("filter")
@@ -169,7 +181,7 @@ class CausalLMBatch(Batch):
         all_input_ids = []
         max_input_length = 0
 
-        # TODO(travis): adapter indices
+        adapter_list = []
 
         next_token_choosers = []
         stopping_criterias = []
@@ -194,27 +206,24 @@ class CausalLMBatch(Batch):
             next_token_choosers.append(self.next_token_choosers[idx])
             stopping_criteria = self.stopping_criterias[idx]
             stopping_criterias.append(stopping_criteria)
-            remaining_decode_tokens = (
-                stopping_criteria.max_new_tokens - stopping_criteria.current_tokens
-            )
+            remaining_decode_tokens = stopping_criteria.max_new_tokens - stopping_criteria.current_tokens
             total_remaining_decode_tokens += remaining_decode_tokens
-            new_padding_right_offset = max(
-                new_padding_right_offset, remaining_decode_tokens
-            )
+            new_padding_right_offset = max(new_padding_right_offset, remaining_decode_tokens)
+
+            adapter_list.append(self.requests[idx].adapter_index)
 
         # Apply indices to input_ids, attention mask, past key values and other items that need to be cached
         input_ids = self.input_ids[keep_indices]
         position_ids = self.position_ids[keep_indices]
+        adapter_indices = self.adapter_meta.adapter_indices[keep_indices]
         self.attention_mask = self.attention_mask[
             keep_indices,
-            -(self.padding_right_offset + max_input_length) : (
-                self.attention_mask.shape[1] - self.padding_right_offset
-            )
+            -(self.padding_right_offset + max_input_length) : (self.attention_mask.shape[1] - self.padding_right_offset)
             + new_padding_right_offset,
         ]
 
         # Ensure that past_key_values tensors can be updated in-place
-        if type(self.past_key_values[0]) == tuple:
+        if isinstance(self.past_key_values[0], tuple):
             self.past_key_values = [list(layer) for layer in self.past_key_values]
 
         # Update tensors in-place to allow incremental garbage collection
@@ -235,6 +244,10 @@ class CausalLMBatch(Batch):
 
         max_tokens = len(request_ids) * max_input_length + total_remaining_decode_tokens
 
+        device = self.input_ids.device
+        adapter_segments, adapter_segment_indices = find_segments(adapter_indices)
+        adapter_segments = torch.tensor(adapter_segments, dtype=torch.int32, device=device)
+
         self.requests = requests
         self.requests_idx_mapping = requests_idx_mapping
         self.input_ids = input_ids
@@ -248,6 +261,13 @@ class CausalLMBatch(Batch):
         self.max_input_length = max_input_length
         self.padding_right_offset = new_padding_right_offset
         self.max_tokens = max_tokens
+        self.adapter_meta = AdapterBatchMetadata(
+            adapter_indices=adapter_indices,
+            adapter_list=adapter_list,
+            adapter_set=set(adapter_list),
+            adapter_segments=adapter_segments,
+            segment_indices=adapter_segment_indices,
+        )
 
         return self
 
@@ -280,6 +300,12 @@ class CausalLMBatch(Batch):
         position_ids = None
         past_key_values = []
         adapter_indices = None
+
+        total_indices_size = sum(b.adapter_meta.adapter_indices.shape[0] for b in batches)
+        adapter_indices = batches[0].adapter_meta.adapter_indices.new_empty(total_indices_size)
+        adapter_list = []
+        adapter_segment_builder = SegmentConcatBuilder()
+        cumulative_adapter_indices_size = 0
 
         # Used for slicing correctly inside the tensors
         # Equivalent to a cumsum on batch sizes
@@ -315,10 +341,15 @@ class CausalLMBatch(Batch):
             # Copy to correct indices
             input_ids[start_index:end_index] = batch.input_ids
 
-            # Create adapter indices
-            if adapter_indices is None:
-                adapter_indices = batch.adapter_indices.new_empty((total_batch_size,))
-            adapter_indices[start_index:end_index] = batch.adapter_indices
+            # Copy over adapter indices
+            adapter_start_index = cumulative_adapter_indices_size
+            adapter_end_index = cumulative_adapter_indices_size + batch.adapter_meta.adapter_indices.shape[0]
+            adapter_indices[adapter_start_index:adapter_end_index] = batch.adapter_meta.adapter_indices
+            cumulative_adapter_indices_size = adapter_end_index
+            adapter_list.extend(batch.adapter_meta.adapter_list)
+
+            # Update adapter segments
+            adapter_segment_builder.concat(batch.adapter_meta.adapter_segments, batch.adapter_meta.segment_indices)
 
             # Create padded tensor
             if attention_mask is None:
@@ -329,11 +360,7 @@ class CausalLMBatch(Batch):
             # We need to slice the attention mask to remove padding from previous steps
             # and to remove unused allocated space
             left_offset = max_input_length - batch.max_input_length
-            batch_left_offset = (
-                batch.attention_mask.shape[1]
-                - batch.max_input_length
-                - batch.padding_right_offset
-            )
+            batch_left_offset = batch.attention_mask.shape[1] - batch.max_input_length - batch.padding_right_offset
             attention_mask[
                 start_index:end_index,
                 left_offset:-padding_right_offset,
@@ -352,10 +379,9 @@ class CausalLMBatch(Batch):
             # BLOOM Keys:   [batch_size * num_heads, head_dim, seq_length]
             # BLOOM Values: [batch_size * num_heads, seq_length, head_dim]
             # And ensure that we can update tensors in-place
-            if type(batch.past_key_values[0]) == tuple:
+            if isinstance(batch.past_key_values[0], tuple):
                 batch.past_key_values = [
-                    [t.view(len(batch), -1, *t.shape[-2:]) for t in layer]
-                    for layer in batch.past_key_values
+                    [t.view(len(batch), -1, *t.shape[-2:]) for t in layer] for layer in batch.past_key_values
                 ]
             elif len(batch.past_key_values[0][0].shape) == 3:
                 for layer in batch.past_key_values:
@@ -363,9 +389,7 @@ class CausalLMBatch(Batch):
                         layer[k] = t.view(len(batch), -1, *t.shape[-2:])
 
             # Add eventual padding tokens that were added while concatenating
-            max_tokens += batch.max_tokens + (
-                max_input_length - batch.max_input_length
-            ) * len(batch)
+            max_tokens += batch.max_tokens + (max_input_length - batch.max_input_length) * len(batch)
 
             start_index = end_index
 
@@ -405,21 +429,15 @@ class CausalLMBatch(Batch):
                 # We slice the keys to remove the padding from previous batches
                 past_seq_len = batch.max_input_length - 1
                 if batch.keys_head_dim_last:
-                    padded_past_keys[
-                        start_index:end_index, :, -past_seq_len:, :
-                    ] = past_keys[:, :, -past_seq_len:, :]
+                    padded_past_keys[start_index:end_index, :, -past_seq_len:, :] = past_keys[:, :, -past_seq_len:, :]
                 else:
                     # BLOOM case
-                    padded_past_keys[
-                        start_index:end_index, :, :, -past_seq_len:
-                    ] = past_keys[:, :, :, -past_seq_len:]
+                    padded_past_keys[start_index:end_index, :, :, -past_seq_len:] = past_keys[:, :, :, -past_seq_len:]
                 del past_keys
 
                 start_index = end_index
 
-            padded_past_values = first_past_kvs[j][1].new_zeros(
-                padded_past_values_shape
-            )
+            padded_past_values = first_past_kvs[j][1].new_zeros(padded_past_values_shape)
             start_index = 0
             for batch in batches:
                 past_values = batch.past_key_values[j][1]
@@ -430,15 +448,15 @@ class CausalLMBatch(Batch):
                 end_index = start_index + len(batch)
                 # We slice the past values to remove the padding from previous batches
                 past_seq_len = batch.max_input_length - 1
-                padded_past_values[
-                    start_index:end_index, :, -past_seq_len:, :
-                ] = past_values[:, :, -past_seq_len:, :]
+                padded_past_values[start_index:end_index, :, -past_seq_len:, :] = past_values[:, :, -past_seq_len:, :]
                 del past_values
 
                 # Update values
                 start_index = end_index
 
             past_key_values.append([padded_past_keys, padded_past_values])
+
+        adapter_segments, adapter_segment_indices = adapter_segment_builder.build()
 
         return cls(
             batch_id=batches[0].batch_id,
@@ -458,7 +476,13 @@ class CausalLMBatch(Batch):
             padding_right_offset=padding_right_offset,
             keys_head_dim_last=batches[0].keys_head_dim_last,
             max_tokens=max_tokens,
-            adapter_indices=adapter_indices,
+            adapter_meta=AdapterBatchMetadata(
+                adapter_indices=adapter_indices,
+                adapter_list=adapter_list,
+                adapter_set=set(adapter_list),
+                adapter_segments=adapter_segments,
+                segment_indices=adapter_segment_indices,
+            ),
         )
 
     def __len__(self):
@@ -471,9 +495,13 @@ class CausalLM(Model):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        compile: bool = False,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
+        if compile:
+            logger.info(f"Model {model_id} does not support CUDA graph compilation. Skipping compilation.")
+
         if torch.cuda.is_available():
             device = torch.device("cuda")
             dtype = torch.float16 if dtype is None else dtype
@@ -495,9 +523,7 @@ class CausalLM(Model):
             model_id,
             revision=revision,
             torch_dtype=dtype,
-            device_map="auto"
-            if torch.cuda.is_available() and torch.cuda.device_count() > 1
-            else None,
+            device_map=("auto" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else None),
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
@@ -515,24 +541,35 @@ class CausalLM(Model):
                 tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
         super(CausalLM, self).__init__(
+            model_id=model_id,
             model=model,
             tokenizer=tokenizer,
             requires_padding=True,
             dtype=dtype,
             device=device,
+            trust_remote_code=trust_remote_code,
         )
+
+        self.dynamic_adapter_loading_enabled = False
 
     @property
     def batch_type(self) -> Type[CausalLMBatch]:
         return CausalLMBatch
 
+    @property
+    def has_adapter_data(self) -> bool:
+        return False
+
     def decode(self, generated_ids: List[int]) -> str:
-        return self.tokenizer.decode(
-            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
     def forward(
-        self, input_ids, attention_mask, position_ids, past_key_values: Optional = None
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        past_key_values: Optional = None,
+        adapter_data: Optional[AdapterBatchData] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         # Model Forward
         kwargs = {
@@ -544,22 +581,35 @@ class CausalLM(Model):
         }
         if self.has_position_ids:
             kwargs["position_ids"] = position_ids
+        if self.has_adapter_data:
+            kwargs["adapter_data"] = adapter_data
 
         outputs = self.model.forward(**kwargs)
         return outputs.logits, outputs.past_key_values
 
     @tracer.start_as_current_span("generate_token")
-    def generate_token(
-        self, batch: CausalLMBatch
-    ) -> Tuple[List[Generation], Optional[CausalLMBatch]]:
+    def generate_token(self, batch: CausalLMBatch) -> Tuple[List[Generation], Optional[CausalLMBatch]]:
         # slice the attention mask to the correct shape
         attention_mask = batch.attention_mask[:, : -batch.padding_right_offset]
+
+        # Assign pointers to LoRA weights
+        # TODO(travis): don't update this if indices haven't changed
+        # Use prefill=True in all cases to force use of SGMV, as the batch is heterogenous
+        adapter_data = AdapterBatchData.from_meta(
+            meta=batch.adapter_meta,
+            weights=self.layer_to_adapter_weights,
+            layer_to_lora_weights={},
+            punica_wrapper=None,
+            prefill=True,
+            prefill_head_indices=None,
+        )
 
         logits, past = self.forward(
             batch.input_ids,
             attention_mask,
             batch.position_ids,
             batch.past_key_values,
+            adapter_data,
         )
 
         # Results
@@ -578,6 +628,8 @@ class CausalLM(Model):
             batch.all_input_ids,
         )
 
+        next_adapter_indices = batch.adapter_meta.adapter_indices.new_empty(len(batch))
+
         # For each member of the batch
         for i, (
             request,
@@ -590,9 +642,7 @@ class CausalLM(Model):
             all_input_ids,
         ) in enumerate(iterator):
             # Select next token
-            next_token_id, logprobs = next_token_chooser(
-                all_input_ids.view(1, -1), logits[-1:, :]
-            )
+            next_token_id, logprobs = next_token_chooser(all_input_ids.view(1, -1), logits[-1:, :])
 
             # Append next token to all tokens
             all_input_ids = torch.cat([all_input_ids, next_token_id])
@@ -611,6 +661,9 @@ class CausalLM(Model):
                 next_token_text,
             )
 
+            # advance FSM state
+            next_token_chooser.next_state(next_token_id_squeezed)
+
             if not stop:
                 stopped = False
 
@@ -619,9 +672,7 @@ class CausalLM(Model):
             if i % self.world_size == self.rank:
                 if stop:
                     # Decode generated tokens
-                    output_text = self.decode(
-                        all_input_ids[-stopping_criteria.current_tokens :, 0]
-                    )
+                    output_text = self.decode(all_input_ids[-stopping_criteria.current_tokens :, 0])
                     # Get seed
                     if isinstance(next_token_chooser.choice, Sampling):
                         seed = next_token_chooser.choice.seed
@@ -629,7 +680,7 @@ class CausalLM(Model):
                         seed = None
 
                     generated_text = GeneratedText(
-                        output_text, stopping_criteria.current_tokens, reason, seed
+                        output_text, stopping_criteria.current_tokens, stopping_criteria.current_skipped, reason, seed
                     )
                 else:
                     generated_text = None
@@ -637,30 +688,32 @@ class CausalLM(Model):
                 # Prefill
                 if stopping_criteria.current_tokens == 1 and request.prefill_logprobs:
                     # Remove generated token to only have prefill and add nan for first prompt token
-                    prefill_logprobs = [float("nan")] + torch.log_softmax(
-                        logits, -1
-                    ).gather(1, all_input_ids[1:]).squeeze(1)[
-                        -new_input_length:-1
-                    ].tolist()
+                    prefill_logprobs = [float("nan")] + torch.log_softmax(logits, -1).gather(
+                        1, all_input_ids[1:]
+                    ).squeeze(1)[-new_input_length:-1].tolist()
                     prefill_token_ids = all_input_ids[-new_input_length:-1]
                     prefill_texts = self.tokenizer.batch_decode(
                         prefill_token_ids,
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
                     )
-                    prefill_tokens = PrefillTokens(
-                        prefill_token_ids, prefill_logprobs, prefill_texts
-                    )
+                    prefill_tokens = NextTokens(prefill_token_ids, prefill_logprobs, prefill_texts, None, None)
+                    prefill_tokens_length = len(prefill_tokens.token_ids)
                 else:
                     prefill_tokens = None
+                    prefill_tokens_length = 0
 
                 generation = Generation(
                     request.id,
                     prefill_tokens,
-                    next_token_id_squeezed,
-                    next_token_logprob,
-                    next_token_text,
-                    next_token_id_squeezed.item() in self.all_special_ids,
+                    prefill_tokens_length,
+                    NextTokens(
+                        [next_token_id_squeezed],
+                        [next_token_logprob],
+                        [next_token_text],
+                        [next_token_id_squeezed.item() in self.all_special_ids],
+                        None,
+                    ),
                     generated_text,
                 )
 
@@ -673,6 +726,7 @@ class CausalLM(Model):
             batch.prefix_offsets[i] = prefix_offset
             batch.read_offsets[i] = read_offset
             batch.max_input_length = max(batch.max_input_length, new_input_length)
+            next_adapter_indices[i] = request.adapter_index
 
         # We finished all generations in the batch; there is no next batch
         if stopped:
@@ -691,5 +745,7 @@ class CausalLM(Model):
 
         # Update past key values
         batch.past_key_values = past
+
+        batch.adapter_meta.adapter_indices = next_adapter_indices
 
         return generations, batch

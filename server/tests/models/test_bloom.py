@@ -1,13 +1,14 @@
+from copy import copy
+
 import pytest
 import torch
-
-from copy import copy
 from transformers import AutoTokenizer
 
-from lorax_server.pb import generate_pb2
-from lorax_server.models.causal_lm import CausalLMBatch
-from lorax_server.utils import weight_hub_files, download_weights
 from lorax_server.models.bloom import BloomCausalLMBatch, BLOOMSharded
+from lorax_server.models.causal_lm import CausalLMBatch
+from lorax_server.pb import generate_pb2
+from lorax_server.utils import download_weights, weight_hub_files
+from lorax_server.utils.tokenizer import TokenizerManager
 
 
 @pytest.fixture(scope="session")
@@ -44,7 +45,7 @@ def default_pb_batch(default_pb_request):
 @pytest.fixture
 def default_bloom_batch(default_pb_batch, bloom_560m_tokenizer):
     return BloomCausalLMBatch.from_pb(
-        default_pb_batch, bloom_560m_tokenizer, torch.float32, torch.device("cpu")
+        default_pb_batch, bloom_560m_tokenizer, TokenizerManager(), None, None, torch.float32, torch.device("cpu")
     )
 
 
@@ -58,7 +59,7 @@ def default_multi_requests_bloom_batch(default_pb_request, bloom_560m_tokenizer)
 
     batch_pb = generate_pb2.Batch(id=0, requests=[req_0, req_1], size=2)
     return BloomCausalLMBatch.from_pb(
-        batch_pb, bloom_560m_tokenizer, torch.float32, torch.device("cpu")
+        batch_pb, bloom_560m_tokenizer, TokenizerManager(), None, None, torch.float32, torch.device("cpu")
     )
 
 
@@ -133,8 +134,8 @@ def test_causal_lm_generate_token(default_bloom, default_bloom_batch):
     )
     assert all([generation.generated_text is None for generation in generations])
     assert all([len(generation.prefill_tokens) == 1 for generation in generations])
-    assert all([generation.token_id.item() == 10264 for generation in generations])
-    assert all([generation.token_text == "Test" for generation in generations])
+    assert all([generation.next_tokens.token_ids[0] == 10264 for generation in generations])
+    assert all([generation.next_tokens.texts[0] == "Test" for generation in generations])
     assert generations[0].request_id == 0
 
 

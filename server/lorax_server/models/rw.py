@@ -1,9 +1,10 @@
-import torch
-
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from typing import List, Optional, Tuple
 
-from lorax_server.models import CausalLM
+import torch
+from loguru import logger
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from lorax_server.models.causal_lm import CausalLM
 
 
 class RW(CausalLM):
@@ -12,9 +13,13 @@ class RW(CausalLM):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        compile: bool = False,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
+        if compile:
+            logger.info(f"Model {model_id} does not support CUDA graph compilation. Skipping compilation.")
+
         if torch.cuda.is_available():
             device = torch.device("cuda")
             dtype = torch.float16 if dtype is None else dtype
@@ -36,9 +41,7 @@ class RW(CausalLM):
             model_id,
             revision=revision,
             torch_dtype=dtype,
-            device_map="auto"
-            if torch.cuda.is_available() and torch.cuda.device_count() > 1
-            else None,
+            device_map=("auto" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else None),
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
@@ -56,11 +59,13 @@ class RW(CausalLM):
                 tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
         super(CausalLM, self).__init__(
+            model_id=model_id,
             model=model,
             tokenizer=tokenizer,
             requires_padding=True,
             dtype=dtype,
             device=device,
+            trust_remote_code=trust_remote_code,
         )
 
     def forward(

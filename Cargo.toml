@@ -1,16 +1,12 @@
 [workspace]
-members = [
-    "router",
-    "router/client",
-    "router/grpc-metadata",
-    "launcher"
-]
+members = ["router", "router/client", "router/grpc-metadata", "launcher"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["Predibase", "Olivier Dehaene"]
 homepage = "https://github.com/predibase/lorax"
+
 
 [profile.release]
 debug = 1

@@ -1,6 +1,7 @@
 # LoRAX Launcher
 
 ```shell
+LoRAX Launcher
 
 Usage: lorax-launcher [OPTIONS]
 
@@ -24,10 +25,20 @@ Options:
           [default: hub]
 
       --adapter-source <ADAPTER_SOURCE>
-          The source of the model to load. Can be `hub` or `s3`. `hub` will load the model from the huggingface hub. `s3` will load the model from the predibase S3 bucket
+          The source of the model to load. Can be `hub` or `s3` or `pbase` `hub` will load the model from the huggingface hub. `s3` will load the model from the predibase S3 bucket. `pbase` will load an s3 model but resolve the metadata from a predibase server
           
           [env: ADAPTER_SOURCE=]
           [default: hub]
+
+      --adapter-memory-fraction <ADAPTER_MEMORY_FRACTION>
+          Reservation of memory set aside for loading adapters onto the GPU.
+          Increasing this value will reduce the size of the KV cache in exchange for allowing more
+          adapters to be loaded onto the GPU at once.
+          This value is NOT scaled relative to `cuda_memory_fraction`, but is expressed in absolute terms.
+          This will be set to `0` if `preloaded_adapter_ids` are provided.
+
+          [env: ADAPTER_MEMORY_FRACTION=]
+          [default: 0.1]
 
       --revision <REVISION>
           The actual revision of the model if you're referring to a model on the hub. You can use a specific commit id or a branch like `refs/pr/2`
@@ -55,7 +66,12 @@ Options:
           Whether you want the model to be quantized. This will use `bitsandbytes` for quantization on the fly, or `gptq`
           
           [env: QUANTIZE=]
-          [possible values: bitsandbytes, bitsandbytes-nf4, bitsandbytes-fp4, gptq]
+          [possible values: bitsandbytes, bitsandbytes-nf4, bitsandbytes-fp4, gptq, awq]
+
+      --compile
+          Whether you want to compile the model into a CUDA graph. This will speed up decoding but increase GPU memory usage
+          
+          [env: COMPILE=]
 
       --dtype <DTYPE>
           The dtype to be forced upon the model. This option cannot be used with `--quantize`
@@ -72,7 +88,7 @@ Options:
           The maximum amount of concurrent requests for this particular deployment. Having a low limit will refuse clients requests instead of having them wait for too long and is usually good to handle backpressure correctly
           
           [env: MAX_CONCURRENT_REQUESTS=]
-          [default: 128]
+          [default: 1024]
 
       --max-best-of <MAX_BEST_OF>
           This is the maximum allowed value for clients to set `best_of`. Best of makes `n` generations at the same time, and return the best in terms of overall log probability over the entire generated sequence
@@ -84,13 +100,13 @@ Options:
           This is the maximum allowed value for clients to set `stop_sequences`. Stop sequences are used to allow the model to stop on more than just the EOS token, and enable more complex "prompting" where users can preprompt the model in a specific way and define their "own" stop token aligned with their prompt
           
           [env: MAX_STOP_SEQUENCES=]
-          [default: 4]
+          [default: 10]
 
       --max-input-length <MAX_INPUT_LENGTH>
           This is the maximum allowed input length (expressed in number of tokens) for users. The larger this value, the longer prompt users can send which can impact the overall memory required to handle the load. Please note that some models have a finite range of sequence they can handle
           
           [env: MAX_INPUT_LENGTH=]
-          [default: 1024]
+          [default: 1792]
 
       --max-total-tokens <MAX_TOTAL_TOKENS>
           This is the most important value to set as it defines the "memory budget" of running clients requests. Clients will send input sequences and ask to generate `max_new_tokens` on top. with a value of `1512` users can send either a prompt of `1000` and ask for `512` new tokens, or send a prompt of `1` and ask for `1511` max_new_tokens. The larger this value, the larger amount each request will be in your RAM and the less effective batching can be
@@ -104,7 +120,7 @@ Options:
           This setting is only applied if there is room in the batch as defined by `max_batch_total_tokens`.
           
           [env: WAITING_SERVED_RATIO=]
-          [default: 1.2]
+          [default: 0.3]
 
       --max-batch-prefill-tokens <MAX_BATCH_PREFILL_TOKENS>
           Limits the number of tokens for the prefill operation. Since this operation take the most memory and is compute bound, it is interesting to limit the number of requests that can be sent
@@ -137,11 +153,18 @@ Options:
           [env: MAX_WAITING_TOKENS=]
           [default: 20]
 
+      --eager-prefill
+
+          Whether to prioritize running prefill before decode to increase batch size during decode (throughput) over
+          liveness in earlier requests (latency). This is set to true by default.
+
+          [default: true]
+
       --max-active-adapters <MAX_ACTIVE_ADAPTERS>
           Maximum number of adapters that can be placed on the GPU and accept requests at a time
           
           [env: MAX_ACTIVE_ADAPTERS=]
-          [default: 128]
+          [default: 1024]
 
       --adapter-cycle-time-s <ADAPTER_CYCLE_TIME_S>
           The time in seconds between adapter exchanges
@@ -152,13 +175,13 @@ Options:
       --hostname <HOSTNAME>
           The IP address to listen on
           
-          [env: HOSTNAME=b3687ab43244]
+          [env: HOSTNAME=]
           [default: 0.0.0.0]
 
   -p, --port <PORT>
           The port to listen on
           
-          [env: PORT=80]
+          [env: PORT=]
           [default: 3000]
 
       --shard-uds-path <SHARD_UDS_PATH>
@@ -182,7 +205,7 @@ Options:
       --huggingface-hub-cache <HUGGINGFACE_HUB_CACHE>
           The location of the huggingface hub cache. Used to override the location if you want to provide a mounted disk for instance
           
-          [env: HUGGINGFACE_HUB_CACHE=/data]
+          [env: HUGGINGFACE_HUB_CACHE=]
 
       --weights-cache-override <WEIGHTS_CACHE_OVERRIDE>
           The location of the huggingface hub cache. Used to override the location if you want to provide a mounted disk for instance
